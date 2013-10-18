@@ -34,12 +34,14 @@ link_directories(${PCL_LIBRARY_DIRS})
 add_definitions(${PCL_DEFINITIONS})
 
 rosbuild_add_executable(object_recording ros/src/object_recording.cpp)
-target_link_libraries(object_recording sfml-audio)
+#target_link_libraries(object_recording sfml-audio1.6)
 
 rosbuild_add_executable(object_recording_client ros/src/object_recording_client.cpp)
 
-
-
+# add compile flag
+#rosbuild_add_compile_flags(cob_object_recording -D__LINUX__ ${SSE_FLAGS})
+rosbuild_add_compile_flags(object_recording -D__LINUX__ ${SSE_FLAGS})
+rosbuild_add_compile_flags(object_recording_client -D__LINUX__ ${SSE_FLAGS})
 
 #common commands for building c++ executables and libraries
 #rosbuild_add_library(${PROJECT_NAME} src/example.cpp)
