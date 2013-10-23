@@ -165,12 +165,14 @@ private:
 	{
 		cv::Rect boundingBox;		// bounding box around letter region
 		double diameter;			// the length of the diagonal of the bounding box
-		cv::Point2d centerPoint;		// center of bounding box (stored explicitly because used very often directly --> saves computational effort)
+		cv::Point2d centerPoint;	// center of bounding box (stored explicitly because used very often directly --> saves computational effort)
 		FontColor fontColor;		// brightness level of letter font: bright or dark
 	};
 
 	struct TextRegion
 	{
+		int originalChainID;				// a unique number which determines the original chain of this bounding box
+		cv::Rect originalChainBoundingBox;	// bounding box of the original chain of letters (different from boundingBox if the chain contained multiple words)
 		cv::Rect boundingBox;				// bounding box of the whole text region, including all bounding boxes of the assigned letters
 		cv::RotatedRect lineEquation;		// equation for the fitted line through the letters (center is a point on the line, size is the normal, angle is the letter fitting score)
 		double qualityScore;				// e.g. quality of line approximation
@@ -182,6 +184,8 @@ private:
 	void detect();
 	void detect_original_epshtein(cv::Mat& image, double scale_factor=1.);
 	void detect_bormann();
+
+	double computeLetterDistanceStddev(const std::vector<Letter>& letters);
 
 	void preprocess();
 
@@ -208,10 +212,10 @@ private:
 	float getMedianStrokeWidth(const cv::Mat& ccmap, const cv::Mat& swtmap, const cv::Rect& rect, int element);
 
 	// merges letterGroups_ to chains of letters, finds bounding box of these chains
-	void chainPairs(std::vector<TextRegion>& textRegions);
+	void chainPairs(std::vector<TextRegion>& textRegions, const cv::Mat& ccmap);
 
 	// finds bounding box of a chain
-	void chainToBox(std::vector< std::vector<int> >& chain, /*std::vector<cv::Rect>& boundingBox,*/ std::vector<TextRegion>& textRegions);
+	void chainToBox(std::vector< std::vector<int> >& chain, const cv::Mat& ccmap, /*std::vector<cv::Rect>& boundingBox,*/ std::vector<TextRegion>& textRegions);
 
 	bool sameTextline(const TextRegion& a, const TextRegion& b);
 
@@ -359,9 +363,12 @@ private:
 
 	// Connect Component
 	std::vector<cv::Rect> labeledRegions_; // all regions (with label) that could be a letter
+	std::vector<int> labeledRegionPixelCount_;	// the number of foreground (letter) pixels for each region
+	std::vector<cv::Point2d> labeledRegionCentroids_;	// foreground pixel centroids of labeled regions
 	std::size_t nComponent_; // =labeledRegions_.size()
 	cv::Mat ccmapBright_, ccmapDark_; // copy of whole cc map
-	std::vector<TextRegion> textRegions_; // contains several region of letters that putatively belong to the same word or word group
+	std::vector<TextRegion> textRegions_; // contains several regions of letters that putatively belong to the same word or word group (collects all detections of one image at one size)
+	std::vector<TextRegion> finalTextRegions_; // contains several regions of letters that putatively belong to the same word or word group (collects all detections of one image at all sizes)
 
 	// Identify Letters
 	std::vector<bool> isLetterRegion_; // which region is letter
@@ -440,7 +447,7 @@ private:
 	// ---  groupLetters ---
 	double distanceRatioParameter; // default: 2.0
 	double medianSwParameter; // default: 2.5
-	double diagonalRatioParamter; // default 2.0
+	double diagonalRatioParameter_; // default 2.0
 	double grayClrParameter; //default: 10.0
 	double clrSingleParameter; // better 15 default: 35
 	double areaParameter; // better: 1.5 ; default: 5

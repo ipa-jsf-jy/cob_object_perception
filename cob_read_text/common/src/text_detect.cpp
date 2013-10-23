@@ -150,6 +150,68 @@ std::vector<cv::RotatedRect>& DetectText::getBoxes()
 	return finalBoxes_;
 }
 
+double DetectText::computeLetterDistanceStddev(const std::vector<Letter>& letters)
+{
+	// stddev of letter distances
+	double maxDist = 0.;
+	cv::Point2i maxDistPair(0,1);
+	cv::Mat letterDistances = cv::Mat::zeros(letters.size(), letters.size(), CV_32FC3);	// letter distance differences in x and y (1st index=letters from i, 2nd index= letters from j)
+	for (unsigned int li=0; li<letters.size(); ++li)
+		for (unsigned int li2=li+1; li2<letters.size(); ++li2)
+		{
+			double dx = (letters[li2].centerPoint.x-letters[li].centerPoint.x);
+			double dy = (letters[li2].centerPoint.y-letters[li].centerPoint.y);
+			double dist = sqrt(dx*dx+dy*dy);
+			letterDistances.at<cv::Vec3f>(li,li2)=cv::Vec3f(dx,dy,dist);
+			letterDistances.at<cv::Vec3f>(li2,li)=cv::Vec3f(-dx,-dy,dist);
+			if (dist > maxDist)
+			{
+				maxDist = dist;
+				maxDistPair.x = li;
+				maxDistPair.y = li2;
+			}
+		}
+	cv::Point2d lineDirection(letters[maxDistPair.y].centerPoint.x-letters[maxDistPair.x].centerPoint.x, letters[maxDistPair.y].centerPoint.y-letters[maxDistPair.x].centerPoint.y);  // direction of the text line
+	for (unsigned int li=0; li<letters.size(); ++li)
+		for (unsigned int li2=li+1; li2<letters.size(); ++li2)
+		{
+			cv::Vec3f& v = letterDistances.at<cv::Vec3f>(li,li2);
+			cv::Point2d letterDirection(v.val[0],v.val[1]);
+			if (letterDirection.x*lineDirection.x+letterDirection.y*lineDirection.y > 0.)
+			{
+				// directing in same direction
+				//letterDistances.at<cv::Vec3f>(li2,li).val[2] *= -1;
+				letterDistances.at<cv::Vec3f>(li2,li).val[2] = 1e10;
+			}
+			else
+			{
+				//v.val[2] *= -1;
+				v.val[2] = 1e10;
+			}
+		}
+	std::vector<float> shortestLetterDistances;
+	double avgLetterDistance = 0.;
+	for (unsigned int li=0; li<letters.size(); ++li)
+	{
+		double minDist = 1e10;
+		for (unsigned int li2=0; li2<letters.size(); ++li2)
+			if (minDist > letterDistances.at<cv::Vec3f>(li,li2).val[2])
+				minDist = letterDistances.at<cv::Vec3f>(li,li2).val[2];
+		if (minDist < 1e10)
+		{
+			shortestLetterDistances.push_back(minDist);
+			avgLetterDistance += minDist;
+		}
+	}
+	avgLetterDistance /= (double)shortestLetterDistances.size();
+	double stddevLetterDistance = 0.;
+	for (unsigned int i=0; i<shortestLetterDistances.size(); ++i)
+		stddevLetterDistance += (shortestLetterDistances[i]-avgLetterDistance)*(shortestLetterDistances[i]-avgLetterDistance);
+	stddevLetterDistance = sqrt(stddevLetterDistance/(double)shortestLetterDistances.size());
+
+	return stddevLetterDistance;
+}
+
 void DetectText::detect()
 {
 	// === pre-processing ===
@@ -200,6 +262,204 @@ void DetectText::detect()
 		cv::destroyAllWindows();
 	}
 	originalImage_ = original_image_copy;
+
+
+	// filter boxes that are only detected at one scale
+	for (unsigned int i=0; i<finalTextRegions_.size(); ++i)
+	{
+		TextRegion& itr = finalTextRegions_[i];
+		bool deleteRegion = true;
+		for (int j=(int)finalTextRegions_.size()-1; j>=0; --j)
+		{
+			if (i==j)
+				continue;
+			TextRegion& jtr = finalTextRegions_[j];
+
+			double commonArea = (itr.boundingBox & jtr.boundingBox).area();
+			if (commonArea > 0.9*itr.boundingBox.area() && commonArea > 0.9*jtr.boundingBox.area())
+				deleteRegion = false;
+		}
+		if (deleteRegion == true && !(itr.originalChainID < scale*10000 && itr.boundingBox.height < 40))//20))
+		{
+			finalTextRegions_.erase(finalTextRegions_.begin()+i);
+			i--;
+		}
+	}
+
+	// filter overlapping boxes
+	for (unsigned int i=0; i<finalTextRegions_.size(); ++i)
+	{
+		for (int j=(int)finalTextRegions_.size()-1; j>=0; --j)
+		{
+			if (i==j)
+				continue;
+
+			TextRegion& itr = finalTextRegions_[i];
+			TextRegion& jtr = finalTextRegions_[j];
+
+			// filter smaller boxes inside a larger box when they reside mostly on letters of the bigger box and have a different font color
+			double commonArea = (itr.boundingBox & jtr.boundingBox).area();
+			if (itr.letters[0].fontColor != jtr.letters[0].fontColor && commonArea <= 0.85*itr.boundingBox.area() && commonArea > 0.85*jtr.boundingBox.area())
+			{
+				double commonAreaLetters = 0.;
+				for (unsigned int li=0; li<itr.letters.size(); ++li)
+					commonAreaLetters += (itr.letters[li].boundingBox & jtr.boundingBox).area();
+
+				if (commonAreaLetters > 0.5*jtr.boundingBox.area())
+				{
+					finalTextRegions_.erase(finalTextRegions_.begin()+j);
+					if (i>j)
+						i--;
+				}
+			}
+
+
+
+//			// delete smaller boxes (which do not originate from a bigger original box) of same letter color which are located in bigger boxes
+//			commonArea = (itr.boundingBox & jtr.originalChainBoundingBox).area();
+//			if (commonArea <= 0.85*itr.boundingBox.area() && commonArea > 0.85*jtr.originalChainBoundingBox.area())
+//			{
+//				double commonAreaLetters = 0.;
+//				for (unsigned int li=0; li<itr.letters.size(); ++li)
+//					commonAreaLetters += (itr.letters[li].boundingBox & jtr.boundingBox).area();
+//
+//				if (commonAreaLetters > 0.5*jtr.boundingBox.area())
+//				{
+//					finalTextRegions_.erase(finalTextRegions_.begin()+j);
+//					if (i>j)
+//						i--;
+//				}
+//			}
+
+//			if (commonArea > 0.85*itr.boundingBox.area() && commonArea > 0.85*jtr.originalChainBoundingBox.area())
+//			{
+//				unsigned int numberLetters = 0;
+//				for (unsigned int k=0; k<finalTextRegions_.size(); ++k)
+//				{
+//					if (k==i)
+//						continue;
+//					if (finalTextRegions_[k].originalChainID == jtr.originalChainID)
+//						numberLetters += finalTextRegions_[k].letters.size();
+//				}
+//
+//				if (itr.letters.size() > numberLetters)
+//				{
+//					finalTextRegions_.erase(finalTextRegions_.begin()+j);
+//					if (i>j)
+//						i--;
+//				}
+//				else
+//				{
+//					finalTextRegions_.erase(finalTextRegions_.begin()+i);
+//					i--;
+//					break;
+//				}
+//			}
+		}
+	}
+
+
+	// filter overlapping boxes
+//	for (unsigned int i=0; i<finalTextRegions_.size(); ++i)
+//	{
+//		for (int j=(int)finalTextRegions_.size()-1; j>=0; --j)
+//		{
+//			if (i==j)
+//				continue;
+//
+//			TextRegion& itr = finalTextRegions_[i];
+//			TextRegion& jtr = finalTextRegions_[j];
+//
+////			std::cout << "---------------"  << " i=" << i << " j=" << j << "\n";
+////			cv::Mat output = originalImage_.clone();
+////			for (unsigned int li=0; li<itr.letters.size(); ++li)
+////				cv::rectangle(output, itr.letters[li].boundingBox, cv::Scalar(255,0,0), 1, 1, 0);
+////			cv::rectangle(output, itr.boundingBox, cv::Scalar(255,0,0), 2, 1, 0);
+////			cv::rectangle(output, jtr.boundingBox, cv::Scalar(255,255,255), 2, 1, 0);
+////			cv::imshow("final regions", output);
+////			cv::waitKey(0);
+//
+//			// if both regions have similar dimension, accept both
+//			double commonArea = (itr.boundingBox & jtr.boundingBox).area();
+//			if (commonArea > 0.85*itr.boundingBox.area() && commonArea > 0.85*jtr.boundingBox.area())
+//			{
+////				std::cout << "  similar size, accept both\n";
+//				continue;
+//			}
+//
+//			double commonAreaLetters = 0.;
+//			for (unsigned int li=0; li<itr.letters.size(); ++li)
+//				commonAreaLetters += (itr.letters[li].boundingBox & jtr.boundingBox).area();
+//
+////			std::cout << "  commonArea/jtr.boundingBox.area()=" << commonArea/jtr.boundingBox.area() << "  commonAreaLetters/jtr.boundingBox.area()=" << commonAreaLetters/jtr.boundingBox.area() << "\n";
+//
+//			// j lies mostly in i
+//			if (commonArea > 0.85*jtr.boundingBox.area() && commonAreaLetters > 0.5*jtr.boundingBox.area())
+//			{
+////				std::cout << "  j lies in i: ";
+//
+//				// if originalChain is similar to the bigger bounding box, delete the bigger one (which was apparently not broken down into its words)
+//				commonArea = (itr.boundingBox & jtr.originalChainBoundingBox).area();
+////				std::cout << "common area i-jo/itr.boundingBox.area()=" << commonArea/itr.boundingBox.area() << "  commonArea/jtr.originalChainBoundingBox.area()=" << commonArea/jtr.originalChainBoundingBox.area() << "  ";
+//				if (commonArea > 0.85*itr.boundingBox.area() && commonArea > 0.85*jtr.originalChainBoundingBox.area())
+//				{
+////					std::cout << "erase i\n";
+//					//finalTextRegions_.erase(finalTextRegions_.begin()+i);
+//					//i--;
+//					break;
+//				}
+//
+//				double iScore=0., jScore=0.;
+//
+//				// number of letters
+//				if (itr.letters.size()>jtr.letters.size())
+//					iScore += 1.;
+//				else if (itr.letters.size()<jtr.letters.size())
+//					jScore += 1.;
+//				else
+//				{
+//					// same number of letters -> are they the same?
+//				}
+//
+//				// stddev of letter distances
+//				double iAvgDiameter=0., jAvgDiameter=0.;
+//				for (unsigned int d=0; d<itr.letters.size(); ++d)
+//					iAvgDiameter += itr.letters[d].diameter;
+//				iAvgDiameter /= (double)itr.letters.size();
+//				for (unsigned int d=0; d<jtr.letters.size(); ++d)
+//					jAvgDiameter += jtr.letters[d].diameter;
+//				jAvgDiameter /= (double)jtr.letters.size();
+//				double iStddevLetterDistance = computeLetterDistanceStddev(itr.letters);
+//				double jStddevLetterDistance = computeLetterDistanceStddev(jtr.letters);
+//				if (iStddevLetterDistance/iAvgDiameter <= jStddevLetterDistance/jAvgDiameter)
+//					iScore+=1.;
+//				else
+//					jScore+=1.;
+//
+//				if (commonAreaLetters > 0.75*jtr.boundingBox.area())
+//					iScore+=1.;
+//
+////				std::cout << "iScore=" << iScore << " jScore=" << jScore << "  ";
+//				if (iScore > jScore)
+//				{
+////					std::cout << "erase j\n";
+//					finalTextRegions_.erase(finalTextRegions_.begin()+j);
+//					if (i>j)
+//						i--;
+//				}
+//			}
+//		}
+//	}
+
+	// write found bounding boxes into the respective structures
+	for (unsigned int i=0; i<finalTextRegions_.size(); i++)
+	{
+		// compute coordinates on original image size
+		finalBoundingBoxes_.push_back(finalTextRegions_[i].boundingBox);
+		finalRotatedBoundingBoxes_.push_back(cv::RotatedRect(cv::Point2f(finalTextRegions_[i].boundingBox.x+0.5*finalTextRegions_[i].boundingBox.width, finalTextRegions_[i].boundingBox.y+0.5*finalTextRegions_[i].boundingBox.height),
+				cv::Size2f(finalTextRegions_[i].boundingBox.width, finalTextRegions_[i].boundingBox.height), 0.f));
+		finalBoundingBoxesQualityScore_.push_back(finalTextRegions_[i].qualityScore);
+	}
 
 	// === Post-processing ===
 	// filter boxes that lie completely inside others
@@ -414,7 +674,10 @@ void DetectText::detect_original_epshtein(cv::Mat& image, double scale_factor)
 
 
 //		cv::bilateralFilter(dummy, image, 7, 20, 50); // sensor noise
-		cv::bilateralFilter(dummy, image, 13, 40, 10); // sensor noise
+//		cv::bilateralFilter(dummy, image, 13, 40, 10); // sensor noise
+		cv::bilateralFilter(dummy, image, 7, 40, 10); // sensor noise
+
+
 //		image = sharpenImage(image);
 //		dummy = image.clone();
 //		cv::bilateralFilter(dummy, image, 9, 30, 10); // sensor noise
@@ -585,17 +848,30 @@ void DetectText::detect_original_epshtein(cv::Mat& image, double scale_factor)
 	std::cout << "[" << time_in_seconds << " s] in breakLinesIntoWords: " << textRegions_.size() << " textRegions_ after breaking blocks into lines" << std::endl << std::endl;
 
 	// write found bounding boxes into the respective structures
-	for (unsigned int i=0; i<textRegions_.size(); i++)
+	for (unsigned int i=0; i<textRegions_.size(); ++i)
 	{
 		// compute coordinates on original image size
 		textRegions_[i].boundingBox.x *= scale_factor;
 		textRegions_[i].boundingBox.y *= scale_factor;
 		textRegions_[i].boundingBox.width *= scale_factor;
 		textRegions_[i].boundingBox.height *= scale_factor;
-		finalBoundingBoxes_.push_back(textRegions_[i].boundingBox);
-		finalRotatedBoundingBoxes_.push_back(cv::RotatedRect(cv::Point2f(textRegions_[i].boundingBox.x+0.5*textRegions_[i].boundingBox.width, textRegions_[i].boundingBox.y+0.5*textRegions_[i].boundingBox.height),
-				cv::Size2f(textRegions_[i].boundingBox.width, textRegions_[i].boundingBox.height), 0.f));
-		finalBoundingBoxesQualityScore_.push_back(textRegions_[i].qualityScore);
+		textRegions_[i].originalChainBoundingBox.x *= scale_factor;
+		textRegions_[i].originalChainBoundingBox.y *= scale_factor;
+		textRegions_[i].originalChainBoundingBox.width *= scale_factor;
+		textRegions_[i].originalChainBoundingBox.height *= scale_factor;
+		textRegions_[i].originalChainID += int(scale_factor*10000);
+		for (unsigned int l=0; l<textRegions_[i].letters.size(); ++l)
+		{
+			textRegions_[i].letters[l].boundingBox.x *= scale_factor;
+			textRegions_[i].letters[l].boundingBox.y *= scale_factor;
+			textRegions_[i].letters[l].boundingBox.width *= scale_factor;
+			textRegions_[i].letters[l].boundingBox.height *= scale_factor;
+		}
+		finalTextRegions_.push_back(textRegions_[i]);
+//		finalBoundingBoxes_.push_back(textRegions_[i].boundingBox);
+//		finalRotatedBoundingBoxes_.push_back(cv::RotatedRect(cv::Point2f(textRegions_[i].boundingBox.x+0.5*textRegions_[i].boundingBox.width, textRegions_[i].boundingBox.y+0.5*textRegions_[i].boundingBox.height),
+//				cv::Size2f(textRegions_[i].boundingBox.width, textRegions_[i].boundingBox.height), 0.f));
+//		finalBoundingBoxesQualityScore_.push_back(textRegions_[i].qualityScore);
 	}
 }
 
@@ -768,6 +1044,8 @@ void DetectText::pipeline()
 	start_time = clock();
 	cv::Mat ccmap(grayImage_.size(), CV_32FC1, cv::Scalar(-1));
 	labeledRegions_.clear();
+	labeledRegionPixelCount_.clear();
+	labeledRegionCentroids_.clear();
 	nComponent_ = connectComponentAnalysis(swtmap, ccmap);
 	time_in_seconds = (clock() - start_time) / (double) CLOCKS_PER_SEC;
 	std::cout << "[" << time_in_seconds << " s] in connectComponentAnalysis: " << nComponent_ << " components found" << std::endl;
@@ -784,7 +1062,7 @@ void DetectText::pipeline()
 
 	start_time = clock();
 	//std::vector<TextRegion> textRegions; //replace or fuse connectedComponents
-	chainPairs(textRegions_);
+	chainPairs(textRegions_, ccmap);
 	time_in_seconds = (clock() - start_time) / (double) CLOCKS_PER_SEC;
 	std::cout << "[" << time_in_seconds << " s] in chainPairs: " << textRegions_.size() << " chains found" << std::endl;
 
@@ -891,7 +1169,7 @@ void DetectText::strokeWidthTransform(const cv::Mat& image, cv::Mat& swtmap, int
 	{
 		cv::Mat output(originalImage_.size(), CV_8UC3);
 		cv::Mat swtmapNormalized;
-		cv::normalize(swtmap, swtmapNormalized, 0, 255, cv::NORM_MINMAX);
+		cv::normalize(swtmap, swtmapNormalized, 0, 196, cv::NORM_MINMAX);
 		for (int y = 0; y < swtmap.rows; y++)
 			for (int x = 0; x < swtmap.cols; x++)
 			{
@@ -1237,6 +1515,7 @@ cv::Mat DetectText::computeEdgeMap(bool rgbCanny)
 
 	if (debug["showEdge"] == true)
 	{
+		cv::imshow("gray image", grayImage_);
 		cv::imshow("gray color edgemap", edgemap);
 		cvMoveWindow("gray color edgemap", 0, 0);
 	}
@@ -1463,10 +1742,9 @@ void DetectText::updateStrokeWidth(cv::Mat& swtmap, std::vector<cv::Point>& star
 	//			for (int i = 0; i < pointStack.size(); i++)
 	//				cv::rectangle(outputtemp, cv::Rect(pointStack[i].x, pointStack[i].y, 1, 1), cv::Scalar(0, 255, 0), 1, 1, 0);
 
-				float newSwtVal;
 				if (purpose == UPDATE)// update swt based on dist between edges
 				{
-					newSwtVal = (sqrt((currY - iy) * (currY - iy) + (currX - ix) * (currX - ix)) + 0.5);
+					float newSwtVal = (sqrt((currY - iy) * (currY - iy) + (currX - ix) * (currX - ix)) + 0.5);
 					strokePointsOrderedByLength.insert(std::pair<double, cv::Point>(newSwtVal, cv::Point(ix, iy)));
 					for (size_t i = 0; i < pointStack.size(); i++)
 						swtmap.at<float>(pointStack[i]) = std::min(swtmap.at<float>(pointStack[i]), newSwtVal);
@@ -1474,7 +1752,7 @@ void DetectText::updateStrokeWidth(cv::Mat& swtmap, std::vector<cv::Point>& star
 				else if (purpose == REFINE) // refine swt based on median
 				{
 					nth_element(SwtValues.begin(), SwtValues.begin() + SwtValues.size() / 2, SwtValues.end());
-					newSwtVal = SwtValues[SwtValues.size() / 2];
+					float newSwtVal = SwtValues[SwtValues.size() / 2];
 					for (size_t i = 0; i < pointStack.size(); i++)
 						swtmap.at<float>(pointStack[i]) = newSwtVal;
 				}
@@ -1504,8 +1782,8 @@ void DetectText::updateStrokeWidth(cv::Mat& swtmap, std::vector<cv::Point>& star
 		// set initial values back to 0
 		for (int y = 0; y < swtmap.rows; y++)
 			for (int x = 0; x < swtmap.cols; x++)
-				if (swtmap.at<float> (y, x) == initialStrokeWidth_)
-					swtmap.at<float> (y, x) = 0;						// todo: check whether this may cause problems when grouping
+				if (swtmap.at<float>(y, x) == initialStrokeWidth_)
+					swtmap.at<float>(y, x) = 0;						// todo: check whether this may cause problems when grouping
 	}
 
 }
@@ -1548,11 +1826,11 @@ int DetectText::connectComponentAnalysis(const cv::Mat& swtmap, cv::Mat& ccmap)
 	// Check all 8 neighbor pixels of each pixel for similar stroke width and for similar color, then form components with enumerative labels
 
 	int ccmapInitialVal = ccmap.at<float>(0, 0);
-	int offsetX8[] = {-1, 1, -1, 0, 1, -1, 0, 1};
+	int offsetX8[] = {-1, 1, -1, 0, 1, -1, 0, 1};	//{-1, 1, 0, 0};
 	//{ -2, -1,  0,  1,  2, -2, -1,  0,  1,  2, -2, -1,  1,  2, -2, -1,  0,  1,  2, -2, -1,  0,  1,  2 };
-	int offsetY8[] = {0, 0, -1, -1, -1, 1, 1, 1};
+	int offsetY8[] = {0, 0, -1, -1, -1, 1, 1, 1};	//{0, 0, -1, 1};
 	//{ -2, -2, -2, -2, -2, -1, -1, -1, -1, -1,  0,  0,  0,  0,  1,  1,  1,  1,  1,  2,  2,  2,  2,  2 };
-	int nNeighbors = 8;//24;//8;
+	int nNeighbors = 8;	//8;//24;//8;
 	int label = 0;
 
 	int vectorSize = ccmap.rows * ccmap.cols;
@@ -1570,7 +1848,7 @@ int DetectText::connectComponentAnalysis(const cv::Mat& swtmap, cv::Mat& ccmap)
 	{
 		for (int x = 0; x < ccmap.cols; x++)
 		{
-			bool connected = false;
+			int connected = 0;
 			if (ccmap.at<float>(y, x) == ccmapInitialVal) // if pixel wasn't processed up to now
 			{
 				vectorPointer = 0;
@@ -1582,8 +1860,17 @@ int DetectText::connectComponentAnalysis(const cv::Mat& swtmap, cv::Mat& ccmap)
 				cv::Point3d componentMeanColor(0.,0.,0.);
 //				int addedPixels = 0;
 
+//				if (edgemap_.at<unsigned char>(y, x) == 255)
+//				{
+//					//std::cout << "start on edge at " << x << "," << y << std::endl;
+//					stackPointer = -1;
+//					connected = -1;
+//				}
+
 				while (stackPointer >= 0)
 				{
+//					do
+//					{
 					currentPointX = pStack[stackPointer];
 					currentPointY = pStack[stackPointer + 1];
 					stackPointer -= 2;
@@ -1591,6 +1878,7 @@ int DetectText::connectComponentAnalysis(const cv::Mat& swtmap, cv::Mat& ccmap)
 					pVector[vectorPointer] = currentPointX;
 					pVector[vectorPointer + 1] = currentPointY;
 					vectorPointer += 2;
+//					} while (stackPointer>=0 && edgemap_.at<unsigned char>(currentPointY, currentPointX) == 255);
 
 					//check which one of the neighbors have similar sw and then label the regions belonging together
 					float meanStrokeWidth = swtmap.at<float>(currentPointY, currentPointX);
@@ -1615,30 +1903,37 @@ int DetectText::connectComponentAnalysis(const cv::Mat& swtmap, cv::Mat& ccmap)
 							float sw1 = swtmap.at<float>(ny, nx);
 							//float meanStrokeWidth = swtmap.at<float>(y, x);
 
-							// compute mean color and intensity for pixel (nx,ny)
-							double intensity = (double)grayImage_.at<unsigned char>(ny, nx);
-							cv::Point3d color((double)originalImage_.at<bgr>(ny, nx).b, (double)originalImage_.at<bgr>(ny, nx).g, (double)originalImage_.at<bgr>(ny, nx).r);
-							for (int i = 0; i < nNeighbors; i++) //check all neighbors of actual neighbor for their color
-							{
-								int my = ny + offsetY8[i];
-								int mx = nx + offsetX8[i];
-								if (my < 0 || mx < 0 || my >= ccmap.rows || mx >= ccmap.cols)
-									continue;
-								intensity += (double)grayImage_.at<unsigned char>(my, mx);
-								color += cv::Point3d((double)originalImage_.at<bgr>(my, mx).b, (double)originalImage_.at<bgr>(my, mx).g, (double)originalImage_.at<bgr>(my, mx).r);
-							}
-							intensity /= (nNeighbors + 1.);
-							color *= 1./(nNeighbors + 1.);
-							if (componentMeanIntensity == 0.)
-							{
-								componentMeanIntensity = intensity;
-								componentMeanColor = color;
-							}
+//							// compute mean color and intensity for pixel (nx,ny)
+//							double intensity = (double)grayImage_.at<unsigned char>(ny, nx);
+//							cv::Point3d color((double)originalImage_.at<bgr>(ny, nx).b, (double)originalImage_.at<bgr>(ny, nx).g, (double)originalImage_.at<bgr>(ny, nx).r);
+//							for (int i = 0; i < nNeighbors; i++) //check all neighbors of actual neighbor for their color
+//							{
+//								int my = ny + offsetY8[i];
+//								int mx = nx + offsetX8[i];
+//								if (my < 0 || mx < 0 || my >= ccmap.rows || mx >= ccmap.cols)
+//									continue;
+//								intensity += (double)grayImage_.at<unsigned char>(my, mx);
+//								color += cv::Point3d((double)originalImage_.at<bgr>(my, mx).b, (double)originalImage_.at<bgr>(my, mx).g, (double)originalImage_.at<bgr>(my, mx).r);
+//							}
+//							intensity /= (nNeighbors + 1.);
+//							color *= 1./(nNeighbors + 1.);
+//							if (componentMeanIntensity == 0.)
+//							{
+//								componentMeanIntensity = intensity;
+//								componentMeanColor = color;
+//							}
+//
+//							double cdx = (componentMeanColor.x-color.x);
+//							double cdy = (componentMeanColor.y-color.y);
+//							double cdz = (componentMeanColor.z-color.z);
+//							double colorDistance = cdx*cdx + cdy*cdy + cdz*cdz;
 
 							// do the pixels have similar stroke width?
-							if (std::max(sw1, meanStrokeWidth) <= swCompareParameter * std::min(sw1, meanStrokeWidth)) // ||		// todo: ratio between a mean value over the component and sw1 better?
+							if (std::max(sw1, meanStrokeWidth) <= swCompareParameter * std::min(sw1, meanStrokeWidth))
+								// ||		// todo: ratio between a mean value over the component and sw1 better?
 								//	(std::max(sw1, meanStrokeWidth) <= 1.5*swCompareParameter * std::min(sw1, meanStrokeWidth) && (fabs(componentMeanIntensity-intensity) < colorCompareParameter) && (fabs(componentMeanColor.x-color.x) < colorCompareParameter) &&
 								//	(fabs(componentMeanColor.y-color.y) < colorCompareParameter) && (fabs(componentMeanColor.z-color.z) < colorCompareParameter)))
+								//&& (colorDistance < 3*3*colorCompareParameter*colorCompareParameter))
 							{
 //								if (processing_method_ == ORIGINAL_EPSHTEIN)
 //								{
@@ -1646,7 +1941,7 @@ int DetectText::connectComponentAnalysis(const cv::Mat& swtmap, cv::Mat& ccmap)
 									stackPointer += 2;
 									pStack[stackPointer] = nx;
 									pStack[stackPointer + 1] = ny;
-									connected = true;
+									connected = 1;
 
 									// update mean stroke width
 									meanStrokeWidth = (meanStrokeWidth*addedNeighbors + sw1)/(float)(addedNeighbors+1);
@@ -1689,7 +1984,7 @@ int DetectText::connectComponentAnalysis(const cv::Mat& swtmap, cv::Mat& ccmap)
 //										stackPointer += 2;
 //										pStack[stackPointer] = nx;
 //										pStack[stackPointer + 1] = ny;
-//										connected = true;
+//										connected = 1;
 //									}
 //								}
 							}
@@ -1697,7 +1992,7 @@ int DetectText::connectComponentAnalysis(const cv::Mat& swtmap, cv::Mat& ccmap)
 					}// loop through neighbors
 				}
 
-				if (connected)
+				if (connected == 1)
 				{
 					ccmap.at<float>(y, x) = label;
 					int minY = ccmap.rows, minX = ccmap.cols, maxY = 0, maxX = 0;
@@ -1716,12 +2011,19 @@ int DetectText::connectComponentAnalysis(const cv::Mat& swtmap, cv::Mat& ccmap)
 					labeledRegions_.push_back(letterRoi);
 					label++;
 				}
-				else
+				else //if (connected == 0)
 					// pixel had no neighbor with similar color and sw
 					ccmap.at<float>(y, x) = -2;
 			}
 		}// loop through ccmap
 	}
+
+//	// clear remaining unset pixels in ccmap (may only happen on unassigned border pixels)
+//	for (int y = 0; y < ccmap.rows; y++)
+//		for (int x = 0; x < ccmap.cols; x++)
+//			if (ccmap.at<float>(y, x) == ccmapInitialVal)
+//				ccmap.at<float>(y, x) = -2;
+
 	return label;
 }
 
@@ -1729,7 +2031,7 @@ void DetectText::identifyLetters(const cv::Mat& swtmap, const cv::Mat& ccmap)
 {
 	// todo: parameter
 	if (processing_method_ == ORIGINAL_EPSHTEIN)
-		minLetterHeight_ = 14; //10;//8;
+		minLetterHeight_ = 11; //14; //10;//8;
 	else
 		minLetterHeight_ = std::max(10, 3 + (originalImage_.rows)/480); //default: 10
 
@@ -1745,30 +2047,51 @@ void DetectText::identifyLetters(const cv::Mat& swtmap, const cv::Mat& ccmap)
 
 	nLetter_ = 0;
 
+	labeledRegionPixelCount_.resize(labeledRegions_.size(), 0);
+	labeledRegionCentroids_.resize(labeledRegions_.size());
+
+	bool show_texts = false;
+
 	// For every found component
-	for (size_t i = 0; i < nComponent_; i++)
+	for (size_t compIdx = 0; compIdx < nComponent_; compIdx++)
 	{
 		//std::vector<bool> innerComponents(nComponent_, false);
-		isLetterRegion_[i] = false;
+		isLetterRegion_[compIdx] = false;
 		float maxStrokeWidth = 0;
 		double sumStrokeWidth = 0;
 		float currentStrokeWidth;
 		bool isLetter = true;
 
-		cv::Rect itr = labeledRegions_[i];
+		cv::Rect itr = labeledRegions_[compIdx];
+
+		if (show_texts == true)
+		{
+			cv::Mat output = originalImage_.clone();
+			cv::rectangle(output, cv::Point(labeledRegions_[compIdx].x, labeledRegions_[compIdx].y),
+					cv::Point(labeledRegions_[compIdx].x + labeledRegions_[compIdx].width, labeledRegions_[compIdx].y + labeledRegions_[compIdx].height),
+					cv::Scalar((255), (255), (255)), 1);
+			cv::imshow("current letter candidate", output);
+			cv::waitKey(0);
+		}
 
 		// rule #1: height of component [not used atm]
 		// rotated text leads to problems. 90° rotated 'l' may only be 1 pixel high.
 		// nevertheless it might be convenient to implement another rule like rule #1 to check for size
-		if ((processing_method_==ORIGINAL_EPSHTEIN) && (itr.height > maxLetterHeight_ || itr.height < minLetterHeight_ || itr.area() < 75/*38/*50*/))
+		if ((processing_method_==ORIGINAL_EPSHTEIN) && (itr.height > maxLetterHeight_ || itr.height < minLetterHeight_))// || itr.area() < 30/*75*//*38/*50*/))
+		{
+			if (show_texts == true)
+				std::cout << "rule 1\n";
 			continue;
+		}
 
 		// rule #2: aspect ratio has to be within 0.1 and 10
 		if (processing_method_ == ORIGINAL_EPSHTEIN)
 		{
-			double aspectRatio = (double)std::max(itr.height, itr.width)/(double)std::min(itr.height, itr.width);
-			isLetter = isLetter && (aspectRatio <= 10.0/*7.0*/);
+			//double aspectRatio = (double)std::max(itr.height, itr.width)/(double)std::min(itr.height, itr.width);
+			isLetter = isLetter && ((double)std::max(itr.height, itr.width) <= 10.0/*7.0*/ * (double)std::min(itr.height, itr.width));
 		}
+		if (show_texts == true && isLetter==false)
+			std::cout << "rule 2\n";
 
 		float maxY = itr.y + itr.height;
 		float minY = itr.y;
@@ -1779,12 +2102,16 @@ void DetectText::identifyLetters(const cv::Mat& swtmap, const cv::Mat& ccmap)
 
 		// compute mean and variance of stroke width
 		std::vector<float> iComponentStrokeWidth;
+//		int neighborhoodX[]={-1, 0, 1, -1, 1, -1, 0, 1};
+//		int neighborhoodY[]={1, 1, 1, 0, 0, -1, -1, -1};
+//		cv::Mat borderPixels = cv::Mat::zeros(maxY-minY, maxX-minX, CV_8UC1);
+//		int numberBorderPixels = 0;
 		for (int y = minY; y < maxY; y++)
 		{
 			for (int x = minX; x < maxX; x++)
 			{
 				int component = static_cast<int>(ccmap.at<float>(y, x)); // ccmap-Label = -2 in case no Region; 0,1,2,3... for every region
-				if (component == static_cast<int>(i))
+				if (component == static_cast<int>(compIdx))
 				{
 					m10 += x;
 					m01 += y;
@@ -1795,26 +2122,47 @@ void DetectText::identifyLetters(const cv::Mat& swtmap, const cv::Mat& ccmap)
 					iComponentStrokeWidth.push_back(currentStrokeWidth);
 					maxStrokeWidth = std::max(maxStrokeWidth, currentStrokeWidth);
 					sumStrokeWidth += currentStrokeWidth;
+
+//					for (int i=0; i<8; ++i)
+//					{
+//						int nx = x+neighborhoodX[i];
+//						int ny = y+neighborhoodY[i];
+//						if (nx>=minX && nx<maxX && ny>=minY && ny<maxY && static_cast<int>(compIdx)!=static_cast<int>(ccmap.at<float>(ny, nx)) && borderPixels.at<uchar>(ny-minY,nx-minX)==0)
+//						{
+//							borderPixels.at<uchar>(ny-minY,nx-minX)=1;
+//							++numberBorderPixels;
+//						}
+//					}
 				}
 //				else if (component >= 0)
 //					innerComponents[component] = true;
 			}
 		}
 		double pixelCount = static_cast<double>(iComponentStrokeWidth.size());
+		labeledRegionPixelCount_[compIdx] = static_cast<int>(iComponentStrokeWidth.size());
 
 		double xc = m10/pixelCount;
 		double yc = m01/pixelCount;
+		labeledRegionCentroids_[compIdx] = cv::Point2d(xc,yc);
 		double af = m20/pixelCount - xc*xc;
 		double bf = 2*m11/pixelCount - xc*yc;
 		double cf = m02/pixelCount - yc*yc;
 		double delta = sqrt(bf * bf + (af - cf) * (af - cf));
 		double momentsRatio = sqrt(std::max(af + cf + delta, af + cf - delta) / std::min(af + cf + delta, af + cf - delta));
+		// rule #3: moments ratio
 		if (momentsRatio > 10.0/*8.0*/)
+		{
+			if (show_texts == true)
+				std::cout << "rule 3\n";
 			continue;
+		}
 
-		// rule #2: remove components that are too small/thin		// todo: reactivate
-//		if (pixelCount < 0.1*itr.area())
-//			continue;
+		// rule #4: remove components that are too small/thin		// todo: reactivate
+		if (pixelCount < 0.1*itr.area())
+			continue;
+		if (show_texts == true && isLetter==false)
+			std::cout << "rule 4\n";
+
 
 		double meanStrokeWidth = sumStrokeWidth / pixelCount;
 		double varianceStrokeWidth = 0;
@@ -1822,41 +2170,78 @@ void DetectText::identifyLetters(const cv::Mat& swtmap, const cv::Mat& ccmap)
 			varianceStrokeWidth += (iComponentStrokeWidth[ii] - meanStrokeWidth) * (iComponentStrokeWidth[ii] - meanStrokeWidth);
 		varianceStrokeWidth = varianceStrokeWidth / pixelCount;
 
-		// rule #2: variance of stroke width of pixels in region that are part of component
-//		isLetter = isLetter && (std::sqrt(varianceStrokeWidth) <= varianceParameter*meanStrokeWidth);
+		// rule #5: variance of stroke width of pixels in region that are part of component
+//		std::cout << "varianceStrokeWidth=" << std::sqrt(varianceStrokeWidth) << "   meanStrokeWidth=" << meanStrokeWidth << std::endl;
+		isLetter = isLetter && (std::sqrt(varianceStrokeWidth) <= varianceParameter*meanStrokeWidth);
+//		isLetter = isLetter && (varianceStrokeWidth <= varianceParameter*meanStrokeWidth); (almost no effect on precision, but negative on recall)
+		if (show_texts == true && isLetter==false)
+			std::cout << "rule 5\n";
 
-		// rule #3: diagonal of rect must be smaller than x*medianStrokeWidth     // paper: medianStrokeWidth , original text_detect: maxStrokeWidth
+		// rule #6: diagonal of rect must be smaller than x*medianStrokeWidth     // paper: medianStrokeWidth , original text_detect: maxStrokeWidth
 		// std::sort(iComponentStrokeWidth.begin(), iComponentStrokeWidth.end());
 		// unsigned int medianStrokeWidth = iComponentStrokeWidth[iComponentStrokeWidth.size() / 2];
 		//isLetter = isLetter && (sqrt(((itr.width) * (itr.width) + (itr.height) * (itr.height))) < maxStrokeWidth * diagonalParameter);
 		std::nth_element(iComponentStrokeWidth.begin(), iComponentStrokeWidth.begin()+iComponentStrokeWidth.size()/2, iComponentStrokeWidth.end());
-		medianStrokeWidth_[i] = *(iComponentStrokeWidth.begin()+iComponentStrokeWidth.size()/2);
+		medianStrokeWidth_[compIdx] = *(iComponentStrokeWidth.begin()+iComponentStrokeWidth.size()/2);
 //		isLetter = isLetter && (pixelCount > 0.2*itr.area() || sqrt((double)(itr.width)*(itr.width) + (itr.height)*(itr.height)) > medianStrokeWidth_[i] * diagonalParameter);		// todo: reactivate
 
-		// rule #4: pixelCount has to be bigger than maxStrokeWidth * x:
-		if (processing_method_==BORMANN)
-			isLetter = isLetter && (pixelCount > maxStrokeWidth * pixelCountParameter);
+//		// rule #6b: component should be consolidated
+//		if ((double)numberBorderPixels/(double)iComponentStrokeWidth.size() > 1.1)
+//			continue;
 
-		// rule #5: width has to be smaller than x * height (x>1)
+		// rule #7: pixelCount has to be bigger than maxStrokeWidth * x:
+//		if (processing_method_==BORMANN)
+			isLetter = isLetter && (pixelCount > maxStrokeWidth * pixelCountParameter);
+		if (show_texts == true && isLetter==false)
+			std::cout << "rule 7\n";
+
+
+		// rule #8: width has to be smaller than x * height (x>1)
 		//  isLetter = isLetter && (itr.width < heightParameter * itr.height);
 
-		// rule #6: number of inner components must be small
+		// rule #9: number of inner components must be small
 		// attention: does not make sense at this place! -> this rule is checked after this loop
 		//isLetter = isLetter && (countInnerLetterCandidates(innerComponents) <= innerLetterCandidatesParameter);
 
-		// rule #7: Ratio of background color / foreground color has to be big.
-		meanRGB_[i] = getMeanIntensity(ccmap, itr, static_cast<int>(i), false);
-		meanBgRGB_[i] = getMeanIntensity(ccmap, itr, static_cast<int>(i), true);
+		// rule #10: Ratio of background color / foreground color has to be big.
+		meanRGB_[compIdx] = getMeanIntensity(ccmap, itr, static_cast<int>(compIdx), false);
+		meanBgRGB_[compIdx] = getMeanIntensity(ccmap, itr, static_cast<int>(compIdx), true);
 		if (processing_method_==BORMANN && isLetter)
 		{
 			if (itr.area() > 200) // too small areas have bigger color difference
-				if ((std::abs(meanRGB_[i][0] - meanBgRGB_[i][0]) < clrComponentParameter) ||
-						(std::abs(meanRGB_[i][1]-meanBgRGB_[i][1]) < clrComponentParameter) || (std::abs(meanRGB_[i][2]-meanBgRGB_[i][2]) < clrComponentParameter))
-					if ((std::abs(meanRGB_[i][0]-meanBgRGB_[i][0])) + (std::abs(meanRGB_[i][1]-meanBgRGB_[i][1])) + (std::abs(meanRGB_[i][2]-meanBgRGB_[i][2])) < clrComponentParameter * 4)
+				if ((std::abs(meanRGB_[compIdx][0] - meanBgRGB_[compIdx][0]) < clrComponentParameter) ||
+						(std::abs(meanRGB_[compIdx][1]-meanBgRGB_[compIdx][1]) < clrComponentParameter) || (std::abs(meanRGB_[compIdx][2]-meanBgRGB_[compIdx][2]) < clrComponentParameter))
+					if ((std::abs(meanRGB_[compIdx][0]-meanBgRGB_[compIdx][0])) + (std::abs(meanRGB_[compIdx][1]-meanBgRGB_[compIdx][1])) + (std::abs(meanRGB_[compIdx][2]-meanBgRGB_[compIdx][2])) < clrComponentParameter * 4)
 						isLetter = false;
 		}
 
-		// rule #8 fg gray has to correspond to actual font color
+		// rule 10b: foreground color should not occur too often in background
+		// ---------------------------------------------------------
+		float similarityThreshold = 30.f;
+		int numberSimilarBgPixels = 0;
+		int numberBgPixels = 0;
+		for (int v=minY; v<maxY; ++v)
+		{
+			for (int u=minX; u<maxX; ++u)
+			{
+				if (ccmap.at<float>(v, u)!=static_cast<int>(compIdx))
+				{
+					numberBgPixels++;
+					bgr clr = originalImage_.at<bgr>(v, u);
+					//std::cout << "\nr=" << (float)clr.r << "\tg=" << (float)clr.g << "\tb=" << (float)clr.b;
+					if (std::abs((float)clr.r-meanRGB_[compIdx][0])<similarityThreshold && std::abs((float)clr.g-meanRGB_[compIdx][1])<similarityThreshold && std::abs((float)clr.b-meanRGB_[compIdx][2])<similarityThreshold)
+						numberSimilarBgPixels++;
+				}
+			}
+		}
+//		std::cout << "\n numberSimilarBgPixels=" << numberSimilarBgPixels << "\tnumberBgPixels=" << numberBgPixels << "\tboxPixels=" << (maxX-minX)*(maxY-minY) << std::endl;
+		if ((double)numberSimilarBgPixels > 0.5*numberBgPixels)
+			isLetter=false;
+		if (show_texts == true && isLetter==false)
+			std::cout << "rule 10b\n";
+		// ---------------------------------------------------------
+
+		// rule #11 fg gray has to correspond to actual font color
 		//    if (isLetter)
 		//      if (firstPass_)
 		//        if (meanRGB_[i][3] < 75 || meanBgRGB_[i][3] > 175)
@@ -1864,12 +2249,12 @@ void DetectText::identifyLetters(const cv::Mat& swtmap, const cv::Mat& ccmap)
 		//        else if (meanRGB_[i][3] > 175 || meanBgRGB_[i][3] < 75)
 		//          isLetter = false;
 
-		isLetterRegion_[i] = isLetter;
+		isLetterRegion_[compIdx] = isLetter;
 		if (isLetter)
 			nLetter_++;
 	}
 
-	// rule #6: number of inner components must be small
+	// rule #12: number of inner components must be small
 	for (unsigned int i=0; i<nComponent_; i++)
 	{
 		if (isLetterRegion_[i] == false)
@@ -1901,6 +2286,8 @@ void DetectText::identifyLetters(const cv::Mat& swtmap, const cv::Mat& ccmap)
 
 		if (countInnerLetterCandidates(innerComponents) > innerLetterCandidatesParameter)
 		{
+			if (show_texts == true)
+				std::cout << "rule 12\n";
 			isLetterRegion_[i] = false;
 			nLetter_--;
 		}
@@ -1943,7 +2330,7 @@ void DetectText::identifyLetters(const cv::Mat& swtmap, const cv::Mat& ccmap)
 				{
 					cv::rectangle(output, cv::Point(labeledRegions_[i].x, labeledRegions_[i].y),
 							cv::Point(labeledRegions_[i].x + labeledRegions_[i].width, labeledRegions_[i].y + labeledRegions_[i].height),
-							cv::Scalar((255), (255), (255)), 1);
+							cv::Scalar(0, 0, 0), 1);
 					for (int y = labeledRegions_[i].y; y < labeledRegions_[i].y + labeledRegions_[i].height; y++)
 						for (int x = labeledRegions_[i].x; x < labeledRegions_[i].x + labeledRegions_[i].width; x++)
 						{
@@ -1960,7 +2347,7 @@ void DetectText::identifyLetters(const cv::Mat& swtmap, const cv::Mat& ccmap)
 				{
 					cv::rectangle(output, cv::Point(labeledRegions_[i].x, labeledRegions_[i].y),
 							cv::Point(labeledRegions_[i].x + labeledRegions_[i].width, labeledRegions_[i].y + labeledRegions_[i].height),
-							cv::Scalar((0), (0), (0)), 1);
+							cv::Scalar(255, 255, 255), 1);
 					for (int y = labeledRegions_[i].y; y < labeledRegions_[i].y + labeledRegions_[i].height; y++)
 						for (int x = labeledRegions_[i].x; x < labeledRegions_[i].x + labeledRegions_[i].width; x++)
 						{
@@ -2011,24 +2398,24 @@ std::vector<float> DetectText::getMeanIntensity(const cv::Mat& ccmap, const cv::
 			{
 				if (ccmap.at<float>(y, x) != felement)
 				{
-					graySum += static_cast<float> (grayImage_.at<unsigned char>(y, x));
+					graySum += static_cast<double> (grayImage_.at<unsigned char>(y, x));
 					count++;
 					clr = originalImage_.at<bgr>(y, x);
-					rSum += (float) clr.r;
-					bSum += (float) clr.b;
-					gSum += (float) clr.g;
+					rSum += (double) clr.r;
+					bSum += (double) clr.b;
+					gSum += (double) clr.g;
 				}
 			}
 			else // foreground pixel color, means letter color
 			{
 				if (ccmap.at<float>(y, x) == felement)
 				{
-					graySum += static_cast<float>(grayImage_.at<unsigned char>(y, x));
+					graySum += static_cast<double>(grayImage_.at<unsigned char>(y, x));
 					count+=1.;
 					clr = originalImage_.at<bgr>(y, x);
-					rSum += (float) clr.r;
-					bSum += (float) clr.b;
-					gSum += (float) clr.g;
+					rSum += (double) clr.r;
+					bSum += (double) clr.b;
+					gSum += (double) clr.g;
 				}
 			}
 		}
@@ -2046,6 +2433,7 @@ void DetectText::groupLetters(const cv::Mat& swtmap, const cv::Mat& ccmap)
 	// group 2 letterboxes together if they fit
 
 	//std::vector<float> medianSw(nComponent_);
+
 
 	double largeLetterCountFactor = 1.0;
 	if (nLetter_ > 200)
@@ -2066,9 +2454,13 @@ void DetectText::groupLetters(const cv::Mat& swtmap, const cv::Mat& ccmap)
 
 			cv::Rect jRect = labeledRegions_[j];
 
+			cv::Mat output;
+			if (debug["showPairs"])
+				output = originalImage_.clone();
+
 			// rule 1: distance between components
-			double dx = (iRect.x+iRect.width/2 - jRect.x-jRect.width/2);
-			double dy = (iRect.y+iRect.height/2 - jRect.y-jRect.height/2);
+			double dx = labeledRegionCentroids_[j].x-labeledRegionCentroids_[i].x;	//(jRect.x-jRect.width/2 - iRect.x+iRect.width/2);
+			double dy = labeledRegionCentroids_[j].y-labeledRegionCentroids_[i].y;	//(jRect.y-jRect.height/2 - iRect.y+iRect.height/2);
 			double distance = sqrt(dx*dx + dy*dy);
 
 			double iDiagonal = sqrt(iRect.height * iRect.height + iRect.width * iRect.width);
@@ -2080,7 +2472,11 @@ void DetectText::groupLetters(const cv::Mat& swtmap, const cv::Mat& ccmap)
 //				if (distance > std::max(iRect.width, jRect.width) * distanceRatioParameter * largeLetterCountFactor)
 //					continue;
 				if (std::abs(dx) > std::max(iRect.width, jRect.width) * distanceRatioParameter) // * largeLetterCountFactor)
+				{
+//					if (debug["showPairs"])
+//						std::cout << "rule 1a violated\n";
 					continue;
+				}
 			}
 			else
 			{
@@ -2088,17 +2484,34 @@ void DetectText::groupLetters(const cv::Mat& swtmap, const cv::Mat& ccmap)
 					continue;
 			}
 
+			// special thresholds for narrow letters like i
+			double heightRatioThreshold = 2.0;
+			double diagonalRatioParameter = diagonalRatioParameter_;
+			if (labeledRegionPixelCount_[i]>0.8*iRect.area() || labeledRegionPixelCount_[j]>0.8*jRect.area())
+			{
+				heightRatioThreshold = 2.3;
+				diagonalRatioParameter = 2.75;
+			}
+
 			// rule 1b: height ratio between two letters must be small enough
 			if (processing_method_==ORIGINAL_EPSHTEIN)
-				if ((double)std::max(iRect.height, jRect.height) > /*1.7*//*2.2*/2.0 * (double)std::min(iRect.height, jRect.height))
+				if ((double)std::max(iRect.height, jRect.height) > /*1.7*//*2.2*/ heightRatioThreshold * (double)std::min(iRect.height, jRect.height))
+				{
+//					if (debug["showPairs"])
+//						std::cout << "rule 1b violated\n";
 					continue;
+				}
 
 			// rule 1c: vertical overlap should be large
 			if (processing_method_==ORIGINAL_EPSHTEIN)
 			{
 				int verticalOverlap = std::min(iRect.y + iRect.height, jRect.y + jRect.height) - std::max(iRect.y, jRect.y);
 				if (verticalOverlap * /*1.3*/1.5 < std::min(iRect.height, jRect.height))
+				{
+//					if (debug["showPairs"])
+//						std::cout << "rule 1c violated\n";
 					continue;
+				}
 			}
 
 			//medianSw[i] = getMedianStrokeWidth(ccmap, swtmap, iRect, static_cast<int>(i));
@@ -2107,17 +2520,30 @@ void DetectText::groupLetters(const cv::Mat& swtmap, const cv::Mat& ccmap)
 			int negativeScore = 0; //high score is bad
 
 			// rule 2: median of stroke width ratio
+//			std::cout << "medianStrokeWidth_[i]=" << medianStrokeWidth_[i] << "  medianStrokeWidth_[j]=" << medianStrokeWidth_[j] << std::endl;
 			if (std::max(medianStrokeWidth_[i], medianStrokeWidth_[j]) > medianSwParameter * std::min(medianStrokeWidth_[i], medianStrokeWidth_[j])) // &&
 					//(std::abs(meanRGB_[i][3] - meanRGB_[j][3]) < 0.4*grayClrParameter && std::max(medianStrokeWidth_[i], medianStrokeWidth_[j]) > 2.5 * std::min(medianStrokeWidth_[i], medianStrokeWidth_[j])))
+			{
+//				if (debug["showPairs"])
+//					std::cout << "rule 2 violated: medianStrokeWidth_[i]=" << medianStrokeWidth_[i] << "\tmedianStrokeWidth_[j]=" << medianStrokeWidth_[j] << "\n";
 				negativeScore++;
+			}
 
-//			// rule 3: diagonal ratio
-//			if (std::max(iDiagonal, jDiagonal) > diagonalRatioParamter * std::min(iDiagonal, jDiagonal))
-//				negativeScore++;
+			// rule 3: diagonal ratio
+			if (std::max(iDiagonal, jDiagonal) > diagonalRatioParameter * std::min(iDiagonal, jDiagonal))
+			{
+//				if (debug["showPairs"])
+//					std::cout << "rule 3 violated\n";
+				negativeScore++;
+			}
 
 			// rule 4: average gray color of letters
 			if (std::abs(meanRGB_[i][3] - meanRGB_[j][3]) > grayClrParameter)
+			{
+//				if (debug["showPairs"])
+//					std::cout << "rule 4 violated\n";
 				negativeScore++;
+			}
 
 //			if ((iRect & jRect).area() > 0.25 * std::min(iRect.area(), jRect.area()))
 //				negativeScore++;
@@ -2125,7 +2551,7 @@ void DetectText::groupLetters(const cv::Mat& swtmap, const cv::Mat& ccmap)
 			if (processing_method_==BORMANN)
 			{
 //				// rule 3: diagonal ratio
-//				if ((std::max(iDiagonal, jDiagonal) / std::min(iDiagonal, jDiagonal)) > diagonalRatioParamter)
+//				if ((std::max(iDiagonal, jDiagonal) / std::min(iDiagonal, jDiagonal)) > diagonalRatioParameter_)
 //					negativeScore++;
 
 //				// rule 4: average gray color of letters
@@ -2197,7 +2623,27 @@ void DetectText::groupLetters(const cv::Mat& swtmap, const cv::Mat& ccmap)
 
 
 			if (isGroup==true)
+			{
 				letterGroups_.push_back(Pair(i, j, dx, dy));
+				//std::cout << "new pair index=" << letterGroups_.size()-1 << std::endl;
+
+				if (debug["showPairs"])
+				{
+					cv::rectangle(output, iRect, cv::Scalar((25 * i + 100) % 255, (35 * (i + 1) + 100) % 255, (45 * (i + 2) + 100) % 255), 1);
+					cv::rectangle(output, jRect, cv::Scalar((25 * i + 100) % 255, (35 * (i + 1) + 100) % 255, (45 * (i + 2) + 100) % 255), 1);
+					if (firstPass_)
+					{
+						cv::imshow("bright pairs", output);
+						cvMoveWindow("bright pairs", 0, 0);
+					}
+					else
+					{
+						cv::imshow("dark pairs", output);
+						cvMoveWindow("dark pairs", 0, 0);
+					}
+					cv::waitKey(0);
+				}
+			}
 
 		}// end for loop j
 	}// end for loop i
@@ -2226,46 +2672,13 @@ float DetectText::getMedianStrokeWidth(const cv::Mat& ccmap, const cv::Mat& swtm
 }
 
 // merges letterGroups_ to chains of letters, finds bounding box of these chains and creates the textRegions data structure
-void DetectText::chainPairs(std::vector<TextRegion>& textRegions)
+void DetectText::chainPairs(std::vector<TextRegion>& textRegions, const cv::Mat& ccmap)
 {
-	if (debug["showPairs"])
-	{
-		cv::Mat output = originalImage_.clone();
-
-		for (unsigned int i = 0; i < letterGroups_.size(); i++)
-		{
-			cv::rectangle(
-					output,
-					cv::Point(labeledRegions_.at(letterGroups_[i].left).x, labeledRegions_.at(letterGroups_[i].left).y),
-					cv::Point(labeledRegions_.at(letterGroups_[i].left).x + labeledRegions_.at(letterGroups_[i].left).width,
-							labeledRegions_.at(letterGroups_[i].left).y + labeledRegions_.at(letterGroups_[i].left).height),
-					cv::Scalar((25 * i + 100) % 255, (35 * (i + 1) + 100) % 255, (45 * (i + 2) + 100) % 255), 1);
-			cv::rectangle(
-					output,
-					cv::Point(labeledRegions_.at(letterGroups_[i].right).x, labeledRegions_.at(letterGroups_[i].right).y),
-					cv::Point(labeledRegions_.at(letterGroups_[i].right).x + labeledRegions_.at(letterGroups_[i].right).width,
-							labeledRegions_.at(letterGroups_[i].right).y + labeledRegions_.at(letterGroups_[i].right).height),
-					cv::Scalar((25 * i + 100) % 255, (35 * (i + 1) + 100) % 255, (45 * (i + 2) + 100) % 255), 1);
-
-			if (firstPass_)
-			{
-				cv::imshow("bright pairs", output);
-				cvMoveWindow("bright pairs", 0, 0);
-			}
-			else
-			{
-				cv::imshow("dark pairs", output);
-				cvMoveWindow("dark pairs", 0, 0);
-			}
-			cv::waitKey(0);
-		}
-	}
-
 	std::vector<std::vector<int> > chains;		// contains letters that belong to the same region, outer index=region index, inner index=letter index (refers to index of labeledRegions)
 	mergePairs(letterGroups_, chains);		// put letters of same regions into one group, yields several of those groups
 
 	//std::vector<cv::Rect> initialBoxes;
-	chainToBox(chains, /*initialBoxes,*/ textRegions); //initialHorizontalBoxes contains rects for every chain component with more than two components(letters)
+	chainToBox(chains, ccmap, /*initialBoxes,*/ textRegions); //initialHorizontalBoxes contains rects for every chain component with more than two components(letters)
 
 	if (debug["showChains"])
 	{
@@ -2287,21 +2700,39 @@ void DetectText::chainPairs(std::vector<TextRegion>& textRegions)
 	}
 }
 
-void DetectText::chainToBox(std::vector<std::vector<int> >& chains, /*std::vector<cv::Rect>& boundingBox,*/ std::vector<TextRegion>& textRegions)
+void DetectText::chainToBox(std::vector<std::vector<int> >& chains, const cv::Mat& ccmap, /*std::vector<cv::Rect>& boundingBox,*/ std::vector<TextRegion>& textRegions)
 {
+//	// for all possible letter rects
+//	for (size_t i = 0; i < labeledRegions_.size(); i++)
+//	{
+//		if (isLetterRegion_[i]==false || 2*labeledRegions_[i].height<originalImage_.rows || 3*labeledRegions_[i].width<originalImage_.cols)
+//			continue;
+//
+//		chains.push_back(std::vector<int>(1, i));
+//		std::cout << "big letter added\n";
+//	}
+
 	for (size_t i = 0; i < chains.size(); i++)
 	{
 		if (chains[i].size() < 3) //Only words with more than 2 letters	// todo: param
-			continue;
+			//if (chains[i].size()==2)
+				continue;
+
+		//std::cout << "chainToBox on chain " << i << std::endl;
 
 		int minX = grayImage_.cols, minY = grayImage_.rows, maxX = 0, maxY = 0;
 		int letterAreaSum = 0;
 		int padding = 0;		// todo: param
 
 		TextRegion textRegion;
+		std::vector<float> meanRGB(3, 0.f);
 		for (size_t j = 0; j < chains[i].size(); j++)
 		{
 			cv::Rect itr = labeledRegions_[chains[i][j]];
+
+			for (unsigned int c=0; c<meanRGB.size(); ++c)
+				meanRGB[c] += meanRGB_[chains[i][j]][c];
+
 			letterAreaSum += itr.width * itr.height;
 			minX = std::min(minX, itr.x);
 			minY = std::min(minY, itr.y);
@@ -2311,13 +2742,148 @@ void DetectText::chainToBox(std::vector<std::vector<int> >& chains, /*std::vecto
 			Letter letter;
 			letter.boundingBox = itr;
 			letter.diameter = sqrt(itr.width*itr.width + itr.height*itr.height);
-			letter.centerPoint = cv::Point2d(itr.x + 0.5 * (double)itr.width, itr.y + 0.5 * (double)itr.height);
+			letter.centerPoint = labeledRegionCentroids_[chains[i][j]]; //cv::Point2d(itr.x + 0.5 * (double)itr.width, itr.y + 0.5 * (double)itr.height);
 			if (firstPass_)
 				letter.fontColor = BRIGHT;
 			else
 				letter.fontColor = DARK;
 			textRegion.letters.push_back(letter);
 		}
+		// ---------------------------------------------------------
+		// remove chains who have the same foreground color as most of the background has
+		for (unsigned int c=0; c<meanRGB.size(); ++c)
+		{
+			meanRGB[c] /= (float)chains[i].size();
+			//std::cout << "meanRGB[" << c << "]=" << meanRGB[c] << "\t";
+		}
+
+		// count pixels of similar color to foreground in background
+		float similarityThreshold = 30.f;
+		int numberSimilarBgPixels = 0;
+		int numberBgPixels = 0;
+		for (int v=minY; v<maxY; ++v)
+		{
+			for (int u=minX; u<maxX; ++u)
+			{
+				bool isBgPixel = true;
+				for (size_t j = 0; j < chains[i].size(); j++)
+					if (ccmap.at<float>(v, u)==(float)chains[i][j])
+						isBgPixel = false;
+				if (isBgPixel==true)
+				{
+					numberBgPixels++;
+					bgr clr = originalImage_.at<bgr>(v, u);
+					//std::cout << "\nr=" << (float)clr.r << "\tg=" << (float)clr.g << "\tb=" << (float)clr.b;
+					if (std::abs((float)clr.r-meanRGB[0])<similarityThreshold && std::abs((float)clr.g-meanRGB[1])<similarityThreshold && std::abs((float)clr.b-meanRGB[2])<similarityThreshold)
+						numberSimilarBgPixels++;
+				}
+			}
+		}
+		//std::cout << "\n numberSimilarBgPixels=" << numberSimilarBgPixels << "\tnumberBgPixels=" << numberBgPixels << "\tboxPixels=" << (maxX-minX)*(maxY-minY) << std::endl;
+		if ((double)numberSimilarBgPixels > 0.3*numberBgPixels)		// todo: increase 0.3 if little more recall needed
+			continue;
+		// ---------------------------------------------------------
+
+//		// ---------------------------------------------------------
+//		// remove chains that belong to a regular pattern
+//		// 1. bounding box height/width grouping
+//		std::vector<cv::Point2f> appearanceGroupsWh;
+//		std::vector<int> appearanceGroupsCount;
+//		std::vector<std::vector<int> > appearanceGroupsIndices;
+//		double whThreshold = 0.4;	// in [pixel deviation/pixel width]
+//		for (unsigned int l=0; l<textRegion.letters.size(); ++l)
+//		{
+//			cv::Rect& bb = textRegion.letters[l].boundingBox;
+//			bool found = false;
+//			for (unsigned int a=0; a<appearanceGroupsWh.size(); ++a)
+//			{
+//				if ((appearanceGroupsWh[a].x-bb.width)*(appearanceGroupsWh[a].x-bb.width)+(appearanceGroupsWh[a].y-bb.height)*(appearanceGroupsWh[a].y-bb.height) < (whThreshold*appearanceGroupsWh[a].x)*(whThreshold*appearanceGroupsWh[a].x))
+//				{
+//					appearanceGroupsWh[a].x = (appearanceGroupsWh[a].x*appearanceGroupsCount[a]+bb.width)/(float)(appearanceGroupsCount[a]+1);
+//					appearanceGroupsWh[a].y = (appearanceGroupsWh[a].y*appearanceGroupsCount[a]+bb.height)/(float)(appearanceGroupsCount[a]+1);
+//					++(appearanceGroupsCount[a]);
+//					appearanceGroupsIndices[a].push_back(l);
+//					found = true;
+//					break;
+//				}
+//			}
+//			if (found == false)
+//			{
+//				appearanceGroupsWh.push_back(cv::Point2f(bb.width, bb.height));
+//				appearanceGroupsCount.push_back(1);
+//				appearanceGroupsIndices.push_back(std::vector<int>(1,l));
+//			}
+//		}
+//		bool validBox = true;
+//		for (unsigned int a=0; a<appearanceGroupsCount.size(); ++a)
+//		{
+//			if (appearanceGroupsCount[a] > 0.75*textRegion.letters.size())
+//			{
+//				// 2. color grouping
+//				std::vector<std::vector<float> > appearanceGroupsColor;
+//				std::vector<int> appearanceGroupsColorCount;
+//				for (unsigned int l=0; l<appearanceGroupsIndices[a].size(); ++l)
+//				{
+//					cv::Rect& bb = textRegion.letters[appearanceGroupsIndices[a][l]].boundingBox;
+//
+//					// compute color descriptor for letter
+//					double step=0.2;
+//					std::vector<float> meanRGB2(25*3, 0.f);
+//					int insertPosition = 0;
+//					for (double sy=0.; sy<1.; sy+=step)
+//					{
+//						for (double sx=0.; sx<1.; sx+=step)
+//						{
+//							int pixels = 0;
+//							for (int v=bb.y+sy*bb.height; v<bb.y+(sy+step)*bb.height; ++v)
+//							{
+//								for (int u=bb.x+sx*bb.width; u<bb.x+(sx+step)*bb.width; ++u)
+//								{
+//									bgr clr = originalImage_.at<bgr>(v, u);
+//									meanRGB2[insertPosition] += clr.r;
+//									meanRGB2[insertPosition+1] += clr.g;
+//									meanRGB2[insertPosition+2] += clr.b;
+//									pixels++;
+//								}
+//							}
+//							for (int i=0; i<3; ++i)
+//								meanRGB2[insertPosition+i] /= (float)pixels;
+//							insertPosition += 3;
+//						}
+//					}
+//
+//					// compare to existing groups
+//					bool found = false;
+//					for (unsigned int a2=0; a2<appearanceGroupsColor.size(); ++a2)
+//					{
+//						double dist = 0.;
+//						for (unsigned int c=0; c<meanRGB2.size(); c++)
+//							dist += (meanRGB2[c]-appearanceGroupsColor[a2][c])*(meanRGB2[c]-appearanceGroupsColor[a2][c]);
+//						if (dist < (3*meanRGB2.size())*(3*meanRGB2.size()))
+//						{
+//							for (unsigned int c=0; c<meanRGB2.size(); c++)
+//								appearanceGroupsColor[a2][c] = (appearanceGroupsColor[a2][c]*appearanceGroupsColorCount[a2]+meanRGB2[c])/(float)(appearanceGroupsColorCount[a2]+1);
+//							appearanceGroupsColorCount[a2]++;
+//							found=true;
+//							break;
+//						}
+//					}
+//					if (found==false)
+//					{
+//						appearanceGroupsColor.push_back(meanRGB2);
+//						appearanceGroupsColorCount.push_back(1);
+//					}
+//				}
+//				for (unsigned int b=0; b<appearanceGroupsColorCount.size(); ++b)
+//				{
+//					if (appearanceGroupsColorCount[b] > 0.75*textRegion.letters.size())
+//						validBox = false;
+//				}
+//			}
+//		}
+//		if (validBox == false)
+//			continue;
+//		// ---------------------------------------------------------
 
 		// add padding around each box
 		minX = std::max(0, minX - padding);
@@ -2327,10 +2893,15 @@ void DetectText::chainToBox(std::vector<std::vector<int> >& chains, /*std::vecto
 
 		//boundingBox.push_back(cv::Rect(minX, minY, maxX - minX, maxY - minY));
 		textRegion.boundingBox = cv::Rect(minX, minY, maxX - minX, maxY - minY);
+		textRegion.originalChainBoundingBox = textRegion.boundingBox;
+		textRegion.originalChainID = i;
 
-		if (textRegion.boundingBox.width > 2.0/*1.9*/ * textRegion.boundingBox.height)
+		//std::cout << "textRegion.boundingBox.width=" << textRegion.boundingBox.width << "  textRegion.boundingBox.height=" << textRegion.boundingBox.height << std::endl;
+		if (textRegion.boundingBox.width > (textRegion.letters.size()<=3 ? 0.25*textRegion.letters.size() : 2.0)/*std::min(textRegion.letters.size()*0.25/*0.5*//*,2.0)*/ /*2.0/*1.9*/ * textRegion.boundingBox.height)
 			textRegions.push_back(textRegion);
 	}
+
+	std::cout << "textRegions.size()=" << textRegions.size() << "\n";
 }
 
 bool DetectText::sameTextline(const TextRegion& a, const TextRegion& b)
@@ -2347,10 +2918,10 @@ bool DetectText::pairsInLine(const Pair& a, const Pair& b)
 {
 	if (a.left==b.left || a.right==b.right)		// todo: use arbitrary angles
 	{
-		int tn = a.dy * b.dx - a.dx * b.dy;
-		int td = a.dx * b.dx + a.dy * b.dy;
+		int tn = a.dy * b.dx - a.dx * b.dy;		// sine between both vectors without normalization (sine(a) = cos(90-a))
+		int td = a.dx * b.dx + a.dy * b.dy;		// cosine between both vectors without normalization
 		// share the same end, opposite direction
-		if (tn * 7 < -td * 4 && tn * 7 > td * 4)
+		if ((td < 0) && (tn*7 > td*4) && (tn*7 < -td*4))		// tan(30deg)=4/7 -> tan(-30) < tan(a) < tan(30) && scalar product between both vectors is negative
 			return true;
 	}
 	else if (a.left==b.right || a.right==b.left)
@@ -2358,7 +2929,7 @@ bool DetectText::pairsInLine(const Pair& a, const Pair& b)
 		int tn = a.dy * b.dx - a.dx * b.dy;
 		int td = a.dx * b.dx + a.dy * b.dy;
 		// share the other end, same direction
-		if (tn * 7 < td * 4 && tn * 7 > -td * 4)
+		if ((td > 0) && (tn*7 < td*4) && (tn*7 > -td*4))		// tan(30deg)=4/7 -> tan(-30) < tan(a) < tan(30) && scalar product between both vectors is positive
 			return true;
 	}
 	return false;
@@ -2383,6 +2954,8 @@ void DetectText::mergePairs(const std::vector<Pair>& groups, std::vector< std::v
 			root = nodes[root].parent;
 		for (unsigned int j=0; j<groups.size(); j++)
 		{
+			//std::cout << "group i=" << i << " j=" << j << "  groups[i].left=" << groups[i].left << "  groups[i].right=" << groups[i].right << "  groups[j].left=" << groups[j].left << "  groups[j].right=" << groups[j].right << std::endl;
+
 			if (i!=j && pairsInLine(groups[nodes[i].element], groups[nodes[j].element])==true)
 			{
 				int root2 = j;
@@ -2414,6 +2987,7 @@ void DetectText::mergePairs(const std::vector<Pair>& groups, std::vector< std::v
 						nodes[node].parent = root;
 						node = temp;
 					}
+					//std::cout << "   parent=" << root<<std::endl;
 				}
 			}
 		}
@@ -2430,7 +3004,10 @@ void DetectText::mergePairs(const std::vector<Pair>& groups, std::vector< std::v
 			nodes[root].rank = ~classIndex++;
 
 		int insertIndex = ~nodes[root].rank;
-		if (insertIndex+1 < (int)chains.size())
+
+		//std::cout << "group=" << i << "   root=" << root << "  insertIndex=" << insertIndex << std::endl;
+
+		if (insertIndex/*+1*/ < (int)chains.size())
 		{
 			// add new letters to chain (do not add if the letter is already in the list)
 			for (int letterNumber=0; letterNumber<2; letterNumber++)
@@ -2452,6 +3029,15 @@ void DetectText::mergePairs(const std::vector<Pair>& groups, std::vector< std::v
 			chains[insertIndex].push_back(groups[i].right);
 		}
 	}
+
+//	std::cout << "chains:\n";
+//	for (unsigned int i=0; i<chains.size(); ++i)
+//	{
+//		std::cout << i << ":";
+//		for (unsigned int j=0; j<chains[i].size(); ++j)
+//			std::cout << "\t" << chains[i][j];
+//		std::cout << "\n";
+//	}
 
 //	// ------------ old code (does not obey direction of merged pairs) --------------
 //
@@ -5749,7 +6335,7 @@ void DetectText::setParams(ros::NodeHandle & nh)
 	nh.getParam("clrComponentParameter", this->clrComponentParameter);
 	nh.getParam("distanceRatioParameter", this->distanceRatioParameter);
 	nh.getParam("medianSwParameter", this->medianSwParameter);
-	nh.getParam("diagonalRatioParamter", this->diagonalRatioParamter);
+	nh.getParam("diagonalRatioParamter", this->diagonalRatioParameter_);
 	nh.getParam("grayClrParameter", this->grayClrParameter);
 	nh.getParam("clrSingleParameter", this->clrSingleParameter);
 	nh.getParam("areaParameter", this->areaParameter);
@@ -5764,19 +6350,27 @@ void DetectText::setParams(ros::NodeHandle & nh)
 	nh.getParam("threshold_sharp", this->threshold_sharp);
 	nh.getParam("amount_sharp", this->amount_sharp);
 	nh.getParam("result_", this->result_);
-	nh.getParam("showEdge", this->debug["showEdge"]);
-	nh.getParam("showSWT", this->debug["showSWT"]);
-	nh.getParam("showLetterCandidates", this->debug["showLetterCandidates"]);
-	nh.getParam("showLetters", this->debug["showLetters"]);
-	nh.getParam("showPairs", this->debug["showPairs"]);
-	nh.getParam("showChains", this->debug["showChains"]);
-	nh.getParam("showBreakLines", this->debug["showBreakLines"]);
-	nh.getParam("showWords", this->debug["showWords"]);
-	nh.getParam("showCriterions", this->debug["showCriterions"]);
-	nh.getParam("showBezier", this->debug["showBezier"]);
-	nh.getParam("showRansac", this->debug["showRansac"]);
-	nh.getParam("showNeighborMerging", this->debug["showNeighborMerging"]);
-	nh.getParam("showResult", this->debug["showResult"]);
+	bool debugAllOff = false;
+	nh.getParam("debugAllOff", debugAllOff);
+	if (debugAllOff==false)
+	{
+		nh.getParam("showEdge", this->debug["showEdge"]);
+		nh.getParam("showSWT", this->debug["showSWT"]);
+		nh.getParam("showLetterCandidates", this->debug["showLetterCandidates"]);
+		nh.getParam("showLetters", this->debug["showLetters"]);
+		nh.getParam("showPairs", this->debug["showPairs"]);
+		nh.getParam("showChains", this->debug["showChains"]);
+		nh.getParam("showBreakLines", this->debug["showBreakLines"]);
+		nh.getParam("showWords", this->debug["showWords"]);
+		nh.getParam("showCriterions", this->debug["showCriterions"]);
+		nh.getParam("showBezier", this->debug["showBezier"]);
+		nh.getParam("showRansac", this->debug["showRansac"]);
+		nh.getParam("showNeighborMerging", this->debug["showNeighborMerging"]);
+		nh.getParam("showResult", this->debug["showResult"]);
+	}
+	else
+		for (std::map<std::string, bool>::iterator it=debug.begin(); it!=debug.end(); it++)
+			it->second = false;
 
 	std::cout << "processing_method:" << processing_method_ << std::endl;
 	std::cout << "smoothImage:" << smoothImage << std::endl;
@@ -5795,7 +6389,7 @@ void DetectText::setParams(ros::NodeHandle & nh)
 	std::cout << "clrComponentParameter:" << clrComponentParameter << std::endl;
 	std::cout << "distanceRatioParameter:" << distanceRatioParameter << std::endl;
 	std::cout << "medianSwParameter:" << medianSwParameter << std::endl;
-	std::cout << "diagonalRatioParamter:" << diagonalRatioParamter << std::endl;
+	std::cout << "diagonalRatioParamter:" << diagonalRatioParameter_ << std::endl;
 	std::cout << "grayClrParameter:" << grayClrParameter << std::endl;
 	std::cout << "clrSingleParameter:" << clrSingleParameter << std::endl;
 	std::cout << "areaParameter:" << areaParameter << std::endl;
@@ -5942,7 +6536,7 @@ void DetectText::breakLinesIntoWords(std::vector<TextRegion>& textRegions)
 	// break text into separate lines without destroying letter boxes
 	cv::Mat output;
 	if (debug["showWords"])
-		output = originalImage_.clone();		// todo: make this a debug parameter
+		output = originalImage_.clone();
 
 	std::vector<TextRegion> wordRegions;
 
@@ -5953,13 +6547,16 @@ void DetectText::breakLinesIntoWords(std::vector<TextRegion>& textRegions)
 		breakingWordsDisplayName = "breaking dark words";
 
 	// used later for a parametric function
-	double p = 0.75;
+	double p = 0.75; // 0.75;    // explanations below (1-p is literally a word separation probability)
 	double a1=-1/(p*p), b1=2/p, c1=0;
 	double a2=1/(-p*p+2*p-1), b2=-2*p/(-p*p+2*p-1), c2=(2*p-1)/(-p*p+2*p-1);
 
 	//For every boundingBox:
 	for (unsigned int textRegionIndex = 0; textRegionIndex < textRegions.size(); textRegionIndex++)
 	{
+		if (debug["showWords"])
+			output = originalImage_.clone();		// todo: make this a debug parameter
+
 		std::vector<Letter>& letters = textRegions[textRegionIndex].letters;
 
 		//which Letters belong to the current boundingBox, average letter size, stddev letter size
@@ -6198,6 +6795,7 @@ void DetectText::breakLinesIntoWords(std::vector<TextRegion>& textRegions)
 		int numberWordRegions = wordRegions.size();
 		if (breakBox == true)
 		{
+			std::vector<TextRegion> newWordRegions;
 			for (unsigned int r = 0; r < letterDistances.size(); r++)
 			{
 				bool letter = false;
@@ -6214,8 +6812,10 @@ void DetectText::breakLinesIntoWords(std::vector<TextRegion>& textRegions)
 					word.boundingBox = re;
 					word.lineEquation = textRegions[textRegionIndex].lineEquation;
 					word.qualityScore = textRegions[textRegionIndex].qualityScore;
+					word.originalChainBoundingBox = textRegions[textRegionIndex].originalChainBoundingBox;
+					word.originalChainID = textRegions[textRegionIndex].originalChainID;
 					// word.letters = ; --> see below
-					wordRegions.push_back(word);
+					newWordRegions.push_back(word);
 				}
 				// reaching the end
 				if (r == letterDistances.size() - 1)
@@ -6225,10 +6825,17 @@ void DetectText::breakLinesIntoWords(std::vector<TextRegion>& textRegions)
 					word.boundingBox = re;
 					word.lineEquation = textRegions[textRegionIndex].lineEquation;
 					word.qualityScore = textRegions[textRegionIndex].qualityScore;
+					word.originalChainBoundingBox = textRegions[textRegionIndex].originalChainBoundingBox;
+					word.originalChainID = textRegions[textRegionIndex].originalChainID;
 					// word.letters = ; --> see below
-					wordRegions.push_back(word);
+					newWordRegions.push_back(word);
 				}
 			}
+			// only separate into single word if the letter/word ratio is large enough
+			if ((letterDistances.size()+1.) < 1.5*newWordRegions.size())
+				wordRegions.push_back(textRegions[textRegionIndex]);
+			else
+				wordRegions.insert(wordRegions.end(), newWordRegions.begin(), newWordRegions.end());
 		}
 		else
 		{

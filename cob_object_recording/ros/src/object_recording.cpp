@@ -15,6 +15,7 @@ ObjectRecording::ObjectRecording(ros::NodeHandle nh)
 {
 	prev_marker_array_size_ = 0;
 	camera_matrix_received_ = false;
+	recorded_current_input_ = 0;
 
 #ifdef WITH_AUDIO_FEEDBACK
 	// prepare sounds
@@ -46,6 +47,8 @@ ObjectRecording::ObjectRecording(ros::NodeHandle nh)
 	// publishers
 	it_pub_ = boost::shared_ptr<image_transport::ImageTransport>(new image_transport::ImageTransport(node_handle_));
 	display_image_pub_ = it_pub_->advertise("display_image", 1);
+	recorded_color_image_pub_ = it_pub_->advertise("recorded_color_image", 1);
+	recorded_depth_image_pub_ = it_pub_->advertise("recorded_depth_image", 1);
 
 	// input synchronization
 	sync_input_ = new message_filters::Synchronizer< message_filters::sync_policies::ApproximateTime<cob_object_detection_msgs::DetectionArray, sensor_msgs::PointCloud2, sensor_msgs::Image> >(10);
@@ -53,7 +56,10 @@ ObjectRecording::ObjectRecording(ros::NodeHandle nh)
 
 	service_server_start_recording_ = node_handle_.advertiseService("start_recording", &ObjectRecording::startRecording, this);
 	service_server_stop_recording_ = node_handle_.advertiseService("stop_recording", &ObjectRecording::stopRecording, this);
+	service_server_reset_current_view_ = node_handle_.advertiseService("reset_current_view", &ObjectRecording::resetCurrentView, this);
 	service_server_save_recorded_object_ = node_handle_.advertiseService("save_recorded_object", &ObjectRecording::saveRecordedObject, this);
+	
+	service_server_save_current_data_ = node_handle_.advertiseService("save_current_data", &ObjectRecording::saveCurrentData, this);
 
 	// dynamic reconfigure
 	dynamic_reconfigure_server_.setCallback(boost::bind(&ObjectRecording::dynamicReconfigureCallback, this, _1, _2));
@@ -132,6 +138,14 @@ bool ObjectRecording::stopRecording(cob_object_detection_msgs::StopObjectRecordi
 
 	ROS_INFO("Stopped recording object '%s'.", current_object_label_.c_str());
 
+	return true;
+}
+
+bool ObjectRecording::resetCurrentView(std_srvs::Empty::Request &req, std_srvs::Empty::Response &res)
+{
+	recording_data_[current_closest_pose_].perspective_recorded = false;
+	recording_data_[current_closest_pose_].distance_to_desired_pose = 1e10;
+	recording_data_[current_closest_pose_].sharpness_score = 0.;
 	return true;
 }
 
@@ -237,6 +251,180 @@ bool ObjectRecording::saveRecordedObject(cob_object_detection_msgs::SaveRecorded
 	return true;
 }
 
+bool ObjectRecording::saveCurrentData(cob_object_detection_msgs::SaveCurrentData::Request &req, cob_object_detection_msgs::SaveCurrentData::Response &res)
+{
+	// take data storage path from request message, if available
+	std::string data_storage_path = data_storage_path_;
+	std::string path_from_message = req.storage_location;
+	current_object_label_ = req.object_label;
+	if (path_from_message.compare("") != 0)
+		data_storage_path = path_from_message;
+
+	ROS_INFO("Request to save current data for object '%s' at path '%s' received.", current_object_label_.c_str(), data_storage_path.c_str());
+
+	// create subfolder for object
+	fs::path top_level_directory(data_storage_path);
+	if (fs::is_directory(top_level_directory) == false)
+	{
+		std::cerr << "ERROR - ObjectRecording::saveCurrentData:" << std::endl;
+		std::cerr << "\t ... Path '" << top_level_directory.string() << "' is not a directory." << std::endl;
+		return false;
+	}
+
+	fs::path package_subfolder = top_level_directory / fs::path("cob_object_recording/");
+	if (fs::is_directory(package_subfolder) == false)
+	{
+		// create subfolder
+		if (fs::create_directory(package_subfolder) == false)
+		{
+			std::cerr << "ERROR - ObjectRecording::saveCurrentData:" << std::endl;
+			std::cerr << "\t ... Could not create path '" << package_subfolder.string() << "'." << std::endl;
+			return false;
+		}
+	}
+
+	object_subfolder_ = package_subfolder / current_object_label_;
+	if (fs::is_directory(object_subfolder_) == false)
+	{
+		// create subfolder
+		if (fs::create_directory(object_subfolder_) == false)
+		{
+			std::cerr << "ERROR - ObjectRecording::saveCurrentData:" << std::endl;
+			std::cerr << "\t ... Could not create path '" << object_subfolder_.string() << "'." << std::endl;
+			return false;
+		}
+	}
+
+	// save camera matrix
+	fs::path calibration_file_name = object_subfolder_ / "camera_calibration.txt";
+	std::ofstream calibration_file(calibration_file_name.string().c_str(), std::ios::out);
+	if (calibration_file.is_open() == false)
+	{
+		std::cerr << "ERROR - ObjectRecording::saveRecordedObject:" << std::endl;
+		std::cerr << "\t ... Could not create file '" << calibration_file_name.string() << "'." << std::endl;
+		return false;
+	}
+	for (int v=0; v<color_camera_matrix_.rows; ++v)
+	{
+		for (int u=0; u<color_camera_matrix_.cols; ++u)
+			calibration_file << color_camera_matrix_.at<double>(v,u) << "\t";
+		calibration_file << std::endl;
+	}
+	calibration_file.close();
+	
+	// clear data container
+	recording_data_.clear();
+	recording_data_.resize(1);
+	
+	ROS_INFO("%i. Data set will be recorded...", recorded_current_input_);
+	registered_callback_ = sync_input_->registerCallback(boost::bind(&ObjectRecording::currentInputCallback, this, _1, _2, _3));
+	
+	return true;
+}
+
+void ObjectRecording::currentInputCallback(const cob_object_detection_msgs::DetectionArray::ConstPtr& input_marker_detections_msg, const sensor_msgs::PointCloud2::ConstPtr& input_pointcloud_msg, const sensor_msgs::Image::ConstPtr& input_image_msg)
+{
+	//std::cout << "Recording data..." << std::endl;
+
+	if (input_marker_detections_msg->detections.size() < 4)
+	{
+		ROS_INFO("ObjectRecording::currentinputCallback: Detected markers not enough.\n");
+		return;
+	}
+			
+	// convert color image to cv::Mat
+	cv_bridge::CvImageConstPtr color_image_ptr;
+	cv::Mat color_image;
+	if (convertColorImageMessageToMat(input_image_msg, color_image_ptr, color_image) == false)
+		return;
+	
+	// convert point cloud 2 message to pointcloud
+	typedef pcl::PointXYZRGB PointType;
+	pcl::PointCloud<PointType> input_pointcloud;
+	pcl::fromROSMsg(*input_pointcloud_msg, input_pointcloud);
+
+	// compute mean coordinate system if multiple markers detected
+	tf::Transform fiducial_pose = computeMarkerPose(input_marker_detections_msg);
+	tf::Transform pose_recorded = fiducial_pose.inverse();
+
+	// check image quality (sharpness)
+	double avg_sharpness = 0.;
+	for (unsigned int i=0; i<input_marker_detections_msg->detections.size(); ++i)
+		avg_sharpness += input_marker_detections_msg->detections[i].score;
+	avg_sharpness /= (double)input_marker_detections_msg->detections.size();
+
+	if (avg_sharpness < sharpness_threshold_)
+	{
+		ROS_WARN("ObjectRecording::inputCallback: Image quality too low. Discarding image with sharpness %.3f (threshold = %.3f)", avg_sharpness, sharpness_threshold_);
+	}
+	else
+	{	
+		if (recorded_current_input_ % 5 == 0)
+		{
+			// save data
+			recording_data_[0].image = color_image;
+			recording_data_[0].pointcloud = input_pointcloud;
+			recording_data_[0].pose_recorded = pose_recorded;
+			recording_data_[0].sharpness_score = avg_sharpness;
+			recording_data_[0].perspective_recorded = true;
+			
+			// display direction to closest position
+			cv::Mat display_image = color_image.clone();
+			cv_bridge::CvImage cv_ptr;
+			cv_ptr.image = display_image;
+			cv_ptr.encoding = "bgr8";
+			display_image_pub_.publish(cv_ptr.toImageMsg());
+	
+			// publish recorded color and depth image for this pose (to check the quality)
+			cv_ptr.image = recording_data_[0].image;
+			cv_ptr.encoding = "bgr8";
+			recorded_color_image_pub_.publish(cv_ptr.toImageMsg());
+			cv::Mat depth_image = cv::Mat::ones(recording_data_[0].pointcloud.height, recording_data_[0].pointcloud.width, CV_8UC1) * 255;
+			double factor = 255./(preferred_recording_distance_+ 1.0);
+			for (unsigned int v=0; v<recording_data_[0].pointcloud.height; ++v)
+				for (unsigned int u=0; u<recording_data_[0].pointcloud.width; ++u)
+					depth_image.at<uchar>(v,u) = std::min((uchar)255, (uchar)(factor * recording_data_[0].pointcloud.at(u,v).z));
+			cv_ptr.image = depth_image;
+			cv_ptr.encoding = "mono8";
+			recorded_depth_image_pub_.publish(cv_ptr.toImageMsg());
+			
+			ROS_WARN("Data recorded. Saving...");
+			
+			// save all perspectives
+			std::cout << std::endl;
+			
+			// construct filename
+			std::stringstream ss;
+			ss << recorded_current_input_/5;
+			
+			fs::path file = object_subfolder_ / ss.str();
+			// segment data from whole image
+			cv::Mat image_segmented = recording_data_[0].image.clone();
+			pcl::PointCloud<pcl::PointXYZRGB> pointcloud_segmented;
+			pcl::copyPointCloud(recording_data_[0].pointcloud, pointcloud_segmented);
+			cv::Scalar uv_learning_boundaries;
+			ImageAndRangeSegmentation(image_segmented, pointcloud_segmented, recording_data_[0].pose_recorded, xyzr_recording_bounding_box_, uv_learning_boundaries);
+			// save image
+			std::string image_filename = file.string() + ".png";
+			cv::imwrite(image_filename, image_segmented);
+	
+			// save pointcloud
+			tf::Vector3& t = recording_data_[0].pose_recorded.getOrigin();
+			pointcloud_segmented.sensor_origin_ = recording_data_[0].pointcloud.sensor_origin_ = Eigen::Vector4f(t.getX(), t.getY(), t.getZ(), 1.0);
+			tf::Quaternion q = recording_data_[0].pose_recorded.getRotation();
+			pointcloud_segmented.sensor_orientation_ = recording_data_[0].pointcloud.sensor_orientation_ = Eigen::Quaternionf(q.getW(), q.getX(), q.getY(), q.getZ());
+			std::string pcd_filename = file.string() + ".pcd";
+			pcl::io::savePCDFile(pcd_filename, pointcloud_segmented, false);
+	
+			std::cout << std::endl;
+	
+			ROS_INFO("%i Current input data saved.", recorded_current_input_);
+		}
+		recorded_current_input_++;
+	}
+	
+}
+
 /// callback for the incoming pointcloud data stream
 void ObjectRecording::inputCallback(const cob_object_detection_msgs::DetectionArray::ConstPtr& input_marker_detections_msg, const sensor_msgs::PointCloud2::ConstPtr& input_pointcloud_msg, const sensor_msgs::Image::ConstPtr& input_image_msg)
 {
@@ -272,10 +460,10 @@ void ObjectRecording::inputCallback(const cob_object_detection_msgs::DetectionAr
 	for (unsigned int i=0; i<recording_data_.size(); ++i)
 	{
 		double distance_translation = recording_data_[i].pose_desired.getOrigin().distance(pose_recorded.getOrigin());
-		double distance_orientation = recording_data_[i].pose_desired.getRotation().angle(pose_recorded.getRotation());
+		double distance_orientation = recording_data_[i].pose_desired.getRotation().angleShortestPath(pose_recorded.getRotation());
 		double distance_pose = distance_translation + distance_orientation;
 
-//		std::cout << "  distance=" << distance_translation << "\t angle=" << distance_orientation << "(t=" << distance_threshold_orientation_ << ")" << std::endl;
+//		std::cout << "  distance=" << distance_translation << "\t angle=" << distance_orientation << " (t=" << distance_threshold_orientation_ << ")" << std::endl;
 //		std::cout << "recording_data_[i].pose_desired: XYZ=(" << recording_data_[i].pose_desired.getOrigin().getX() << ", " << recording_data_[i].pose_desired.getOrigin().getY() << ", " << recording_data_[i].pose_desired.getOrigin().getZ() << "), WABC=(" << recording_data_[i].pose_desired.getRotation().getW() << ", " << recording_data_[i].pose_desired.getRotation().getX() << ", " << recording_data_[i].pose_desired.getRotation().getY() << ", " << recording_data_[i].pose_desired.getRotation().getZ() << "\n";
 //		std::cout << "                  pose_recorded: XYZ=(" << pose_recorded.getOrigin().getX() << ", " << pose_recorded.getOrigin().getY() << ", " << pose_recorded.getOrigin().getZ() << "), WABC=(" << pose_recorded.getRotation().getW() << ", " << pose_recorded.getRotation().getX() << ", " << pose_recorded.getRotation().getY() << ", " << pose_recorded.getRotation().getZ() << "\n";
 
@@ -321,6 +509,14 @@ void ObjectRecording::inputCallback(const cob_object_detection_msgs::DetectionAr
 #endif
 		}
 	}
+	current_closest_pose_ = closest_pose;
+
+	// pan/tilt
+	tf::Vector3& t = recording_data_[closest_pose].pose_recorded.getOrigin();
+	double pan = atan2(t.getY(), t.getX());
+	double tilt = asin(t.getZ()/t.length());
+	std::stringstream ss;
+	ss << "pan=" << pan*180/CV_PI << " tilt=" << tilt*180/CV_PI;
 
 //	// play proximity sound w.r.t. to target pose distance
 //	if (playing_hit_sound == false && closest_translation_distance < 2.*distance_threshold_translation_ && closest_orientation_distance < 2.*distance_threshold_orientation_);
@@ -342,6 +538,7 @@ void ObjectRecording::inputCallback(const cob_object_detection_msgs::DetectionAr
 	cv::line(display_image, cv::Point(display_image.cols/2+du-20*cos_x_angle, display_image.rows/2+dv+20*sin_x_angle), cv::Point(display_image.cols/2+du+20*cos_x_angle, display_image.rows/2+dv-20*sin_x_angle), cv::Scalar(255,0,0,128), 2);
 	cv::circle(display_image, cv::Point(display_image.cols/2, display_image.rows/2), 10, cv::Scalar(0,255,0,128), 2);
 	cv::line(display_image, cv::Point(display_image.cols/2-20, display_image.rows/2), cv::Point(display_image.cols/2+20, display_image.rows/2), cv::Scalar(0,255,0,128), 2);
+	cv::putText(display_image, ss.str().c_str(), cv::Point(20,20), cv::FONT_HERSHEY_PLAIN, 2.0, CV_RGB(0, 255, 0), 2);
 	cv_bridge::CvImage cv_ptr;
 	cv_ptr.image = display_image;
 	cv_ptr.encoding = "bgr8";
@@ -351,6 +548,21 @@ void ObjectRecording::inputCallback(const cob_object_detection_msgs::DetectionAr
 
 	// display the markers indicating the already recorded perspectives and the missing
 	publishRecordingPoseMarkers(input_marker_detections_msg, fiducial_pose);
+
+	// publish recorded color and depth image for this pose (to check the quality)
+	cv_ptr.image = recording_data_[closest_pose].image;
+	cv::putText(cv_ptr.image, ss.str().c_str(), cv::Point(20,20), cv::FONT_HERSHEY_PLAIN, 2.0, CV_RGB(0, 255, 0), 2);
+	cv_ptr.encoding = "bgr8";
+	recorded_color_image_pub_.publish(cv_ptr.toImageMsg());
+	cv::Mat depth_image = cv::Mat::ones(recording_data_[closest_pose].pointcloud.height, recording_data_[closest_pose].pointcloud.width, CV_8UC1) * 255;
+	double factor = 255./(preferred_recording_distance_+ 1.0);
+	for (unsigned int v=0; v<recording_data_[closest_pose].pointcloud.height; ++v)
+		for (unsigned int u=0; u<recording_data_[closest_pose].pointcloud.width; ++u)
+			depth_image.at<uchar>(v,u) = std::min((uchar)255, (uchar)(factor * recording_data_[closest_pose].pointcloud.at(u,v).z));
+	cv_ptr.image = depth_image;
+	cv::putText(cv_ptr.image, ss.str().c_str(), cv::Point(20,20), cv::FONT_HERSHEY_PLAIN, 2.0, CV_RGB(255, 255, 255), 2);
+	cv_ptr.encoding = "mono8";
+	recorded_depth_image_pub_.publish(cv_ptr.toImageMsg());
 }
 
 
