@@ -14,12 +14,12 @@ def recognition_service_client(object_id):
     rospy.wait_for_service('/fiducials/get_fiducials')
     try:
         recognition_service = rospy.ServiceProxy('/fiducials/get_fiducials', DetectObjects)
-	req = DetectObjectsRequest()
-	req.object_name = String(object_id) #Not yet implemented
-	req.roi.x_offset = 0; #Not yet implemented
-	req.roi.y_offset = 0; #Not yet implemented
-	req.roi.width = 0; #Not yet implemented
-	req.roi.height = 0; #Not yet implemented
+		req = DetectObjectsRequest()
+		req.object_name = String(object_id) #Not yet implemented
+		req.roi.x_offset = 0; #Not yet implemented
+		req.roi.y_offset = 0; #Not yet implemented
+		req.roi.width = 0; #Not yet implemented
+		req.roi.height = 0; #Not yet implemented
 	print "[fiducials] request ", req
         res = recognition_service(req)
 	if len(res.object_list.detections) <= 0:

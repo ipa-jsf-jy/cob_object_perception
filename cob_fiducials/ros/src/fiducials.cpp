@@ -69,6 +69,7 @@
 
 #include <tf/transform_listener.h>
 #include <tf/transform_broadcaster.h>
+#include <tf/tf.h>
 #include <cv_bridge/cv_bridge.h>
 #include <sensor_msgs/image_encodings.h>
 
@@ -84,6 +85,7 @@
 //#include <cob_fiducials/fiducialsConfig.h>
 //#include <dynamic_reconfigure/server.h>
 #include <cob_object_detection_msgs/DetectObjects.h>
+#include <cob_object_detection_msgs/TrainObject.h>
 #include <cob_vision_utils/GlobalDefines.h>
 #include <cob_vision_utils/VisionUtils.h>
 #include <cob_fiducials/FiducialDefines.h>
@@ -92,8 +94,10 @@
 
 #include <boost/thread/mutex.hpp>
 #include <boost/timer.hpp>
+#include <boost/filesystem.hpp>
 
 //#include "opencv/highgui.h"
+#include <iostream>
 
 using namespace message_filters;
 
@@ -136,6 +140,8 @@ private:
     // Service definitions
     ros::ServiceServer detect_fiducials_service_; ///< Service server to request fidcuial detection
     ros::ServiceServer stop_tf_service_; 
+    
+    ros::ServiceServer detect_fiducials_from_file_srv_;
     // Publisher definitions
     ros::Publisher detect_fiducials_pub_;
     ros::Publisher fiducials_marker_array_publisher_;
@@ -170,6 +176,7 @@ private:
     CobFiducialsNode::t_Mode ros_node_mode_;	///< Specifys if node is started as topic or service
     std::string model_directory_; ///< Working directory, from which models are loaded and saved
     std::string model_filename_;
+    std::string image_dir_;
 
     boost::mutex mutexQ_;
     boost::condition_variable condQ_;
@@ -231,6 +238,8 @@ public:
         if (ros_node_mode_ == MODE_SERVICE || ros_node_mode_ == MODE_TOPIC_AND_SERVICE)
         {
             detect_fiducials_service_ = node_handle_.advertiseService("get_fiducials", &CobFiducialsNode::detectFiducialsServiceCallback, this);
+            //jsf-jy: service for extraction of image files
+            detect_fiducials_from_file_srv_ = node_handle_.advertiseService("get_fiducials_from_file", &CobFiducialsNode::detectFiducialsFFServiceCallback, this);
         }
 
         // Publisher for visualization/debugging
@@ -659,7 +668,293 @@ public:
             return false;
         return true;
     }
-
+    
+    bool detectFiducialsFFServiceCallback(cob_object_detection_msgs::TrainObject::Request &req, 
+    									  cob_object_detection_msgs::TrainObject::Response &res)
+    {
+    	if (!detectFiducialsFF(req.object_name))
+		{
+			ROS_ERROR("[detect_fiducials_from_file] detect fiducials from file failed");
+			return false;
+		}
+    	return true;
+    }
+    
+    bool detectFiducialsFF(std::string object_name)
+    {
+    	std::vector<std::vector<double> > odo_vector;
+		//std::string image_folder = image_dir_ + object_name + "/";
+		std::string image_folder = image_dir_;
+    	for(int idx = 0; 1;idx++)
+    	{		
+    		std::stringstream ss;
+	    	ss << idx;
+	    	std::string color_image_name = "RangeCamIntensity_8U3_0_00";
+	    	if (idx < 10)
+	    		color_image_name += "00" + ss.str();
+	    	else if (idx < 100)
+	    		color_image_name += "0" + ss.str();
+	    	else if (idx < 1000)
+	    		color_image_name += ss.str();
+	    	else
+	    	{
+	    		ROS_ERROR("Image number limit reached.");
+	    		break;
+	    	}
+	    	std::string image_path = image_folder + color_image_name + ".png";
+	    	if (boost::filesystem2::exists(image_path))
+	    	{
+		    	cv::Mat color_image = cv::imread(image_path, 1);
+		    	detection_array_.detections.clear();
+		    	
+		        unsigned int pose_array_size = 0;
+		
+		        // Detect fiducials and assign results
+		        std::vector<ipa_Fiducials::t_pose> tags_vec;
+		        std::vector<std::vector<double> >vec_vec7d;
+		        tf::Vector3 mean_translation;
+		        tf::Vector3 mean_translation_current;
+		        tf::Quaternion mean_orientation(0.,0.,0.);
+		        tf::Transform fiducial_pose;
+		        tf::Transform odo_data;
+		        
+		        //Init tag detector
+		        if (camera_matrix_initialized_ == false)
+		        {	
+		        	//TODO: load intrinsic matrix from file or camera!
+		            camera_matrix_ = cv::Mat::zeros(3,3,CV_64FC1);
+		            camera_matrix_.at<double>(0,0) = 1050;//1072.5034726;//1050;//525.0;
+		            camera_matrix_.at<double>(0,2) = 639.5;//639.6127529;//639.5;//319.5;
+		            camera_matrix_.at<double>(1,1) = 1050;//1072.3628539;//1050;//525.0;
+		            camera_matrix_.at<double>(1,2) = 511.5;//515.4210648;//511.5;//239.5;
+		            camera_matrix_.at<double>(2,2) = 1;
+		
+		            ROS_INFO("[fiducials] Initializing fiducial detector with camera matrix");
+			
+					if (tag_detector_->Init(camera_matrix_, model_directory_ + model_filename_, log_or_calibrate_sharpness_measurements_) & ipa_Utils::RET_FAILED)
+					{
+						ROS_ERROR("[fiducials] Initializing fiducial detector with camera matrix [FAILED]");
+						return false;
+					}
+		            camera_matrix_initialized_ = true;
+		        }
+		
+				tf_lock_.lock();
+				marker_tf_.frame_id_ = "";
+				tf_lock_.unlock();
+			
+				unsigned long ret_val = ipa_Utils::RET_OK;
+				ret_val = tag_detector_->GetPose(color_image, tags_vec);
+			
+				if (ret_val & ipa_Utils::RET_OK)
+			    {
+			        pose_array_size = tags_vec.size();
+			        ROS_INFO("Detected %d Tags", pose_array_size);
+			        if ( pose_array_size <=4 )
+			        {
+				        // TODO: Average results
+				        for (unsigned int i=0; i<pose_array_size; i++)
+				        {
+				            cob_object_detection_msgs::Detection fiducial_instance;
+				
+							std::stringstream ss;
+							ss << "tag_" << tags_vec[i].id;
+							fiducial_instance.header = detection_array_.header;
+				            fiducial_instance.label = ss.str();
+				            fiducial_instance.detector = tag_detector_->GetType();
+				            fiducial_instance.score = 0;
+				            fiducial_instance.bounding_box_lwh.x = 0;
+				            fiducial_instance.bounding_box_lwh.y = 0;
+				            fiducial_instance.bounding_box_lwh.z = 0;
+				
+				            // TODO: Set Mask
+				            cv::Mat frame(3,4, CV_64FC1);
+				            for (int k=0; k<3; k++)
+				                for (int l=0; l<3; l++)
+				                    frame.at<double>(k,l) = tags_vec[i].rot.at<double>(k,l);
+				            frame.at<double>(0,3) = tags_vec[i].trans.at<double>(0,0);
+				            frame.at<double>(1,3) = tags_vec[i].trans.at<double>(1,0);
+				            frame.at<double>(2,3) = tags_vec[i].trans.at<double>(2,0);
+				            std::vector<double> vec7d = FrameToVec7(frame);
+				            vec_vec7d.push_back(vec7d);
+				
+				            // Results are given in CfromO
+				            fiducial_instance.pose.pose.position.x =  vec7d[0];
+				            fiducial_instance.pose.pose.position.y =  vec7d[1];
+				            fiducial_instance.pose.pose.position.z =  vec7d[2];
+				            fiducial_instance.pose.pose.orientation.w =  vec7d[3];
+				            fiducial_instance.pose.pose.orientation.x =  vec7d[4];
+				            fiducial_instance.pose.pose.orientation.y =  vec7d[5];
+				            fiducial_instance.pose.pose.orientation.z =  vec7d[6];
+				
+				            fiducial_instance.pose.header = detection_array_.header;
+				
+				    		// Analyze the image sharpness at the area inside the detected marker
+				            if (compute_sharpness_measure_ == true)
+				            {
+				            	double sharpness_measure;
+				            	tag_detector_->GetSharpnessMeasure(color_image, tags_vec[i], tag_detector_->GetGeneralFiducialParameters(tags_vec[i].id), sharpness_measure, sharpness_calibration_parameter_m_, sharpness_calibration_parameter_n_);
+				            	fiducial_instance.score = sharpness_measure;
+				            }
+				
+				            detection_array_.detections.push_back(fiducial_instance);
+				            if (debug_verbosity_ == 1)
+				                ROS_INFO("[fiducials] Detected Tag '%s' at x,y,z,rw,rx,ry,rz ( %f, %f, %f, %f, %f, %f, %f ) ",
+				                         fiducial_instance.label.c_str(), vec7d[0], vec7d[1], vec7d[2],
+				                         vec7d[3], vec7d[4], vec7d[5], vec7d[6]);
+				            //TODO: save the fiducial information and calculate the odometrie
+				            // use data type tf::Transform and method inverse()
+				            if (i==0)
+				            {
+				            	mean_translation = tf::Vector3(vec7d[0],vec7d[1],vec7d[2]);
+				            	mean_orientation = tf::Quaternion(vec7d[4],vec7d[5],vec7d[6],vec7d[3]);
+				            }
+				            else
+				            {
+				            	mean_translation += tf::Vector3(vec7d[0],vec7d[1],vec7d[2]);
+				            	mean_orientation += tf::Quaternion(vec7d[4],vec7d[5],vec7d[6],vec7d[3]);
+				            }
+			            	}
+				        mean_translation /= pose_array_size;
+				        mean_orientation /= pose_array_size;
+				        mean_orientation.normalize();
+				        fiducial_pose = tf::Transform(mean_orientation, mean_translation);
+				        odo_data = fiducial_pose.inverse();
+			        }
+			        else // noise tag detected
+			        {
+			        	int invalid_tag = 0;
+				        for (unsigned int i=0; i<pose_array_size; i++)
+				        {
+				            cob_object_detection_msgs::Detection fiducial_instance;
+				
+							std::stringstream ss;
+							ss << "tag_" << tags_vec[i].id;
+							fiducial_instance.header = detection_array_.header;
+				            fiducial_instance.label = ss.str();
+				            fiducial_instance.detector = tag_detector_->GetType();
+				            fiducial_instance.score = 0;
+				            fiducial_instance.bounding_box_lwh.x = 0;
+				            fiducial_instance.bounding_box_lwh.y = 0;
+				            fiducial_instance.bounding_box_lwh.z = 0;
+				
+				            // TODO: Set Mask
+				            cv::Mat frame(3,4, CV_64FC1);
+				            for (int k=0; k<3; k++)
+				                for (int l=0; l<3; l++)
+				                    frame.at<double>(k,l) = tags_vec[i].rot.at<double>(k,l);
+				            frame.at<double>(0,3) = tags_vec[i].trans.at<double>(0,0);
+				            frame.at<double>(1,3) = tags_vec[i].trans.at<double>(1,0);
+				            frame.at<double>(2,3) = tags_vec[i].trans.at<double>(2,0);
+				            std::vector<double> vec7d = FrameToVec7(frame);
+				            vec_vec7d.push_back(vec7d);
+				
+				            // Results are given in CfromO
+				            fiducial_instance.pose.pose.position.x =  vec7d[0];
+				            fiducial_instance.pose.pose.position.y =  vec7d[1];
+				            fiducial_instance.pose.pose.position.z =  vec7d[2];
+				            fiducial_instance.pose.pose.orientation.w =  vec7d[3];
+				            fiducial_instance.pose.pose.orientation.x =  vec7d[4];
+				            fiducial_instance.pose.pose.orientation.y =  vec7d[5];
+				            fiducial_instance.pose.pose.orientation.z =  vec7d[6];
+				
+				            fiducial_instance.pose.header = detection_array_.header;
+				
+				    		// Analyze the image sharpness at the area inside the detected marker
+				            if (compute_sharpness_measure_ == true)
+				            {
+				            	double sharpness_measure;
+				            	tag_detector_->GetSharpnessMeasure(color_image, tags_vec[i], tag_detector_->GetGeneralFiducialParameters(tags_vec[i].id), sharpness_measure, sharpness_calibration_parameter_m_, sharpness_calibration_parameter_n_);
+				            	fiducial_instance.score = sharpness_measure;
+				            }
+				
+				            detection_array_.detections.push_back(fiducial_instance);
+				            if (debug_verbosity_ == 1)
+				                ROS_INFO("[fiducials] Detected Tag '%s' at x,y,z,rw,rx,ry,rz ( %f, %f, %f, %f, %f, %f, %f ) ",
+				                         fiducial_instance.label.c_str(), vec7d[0], vec7d[1], vec7d[2],
+				                         vec7d[3], vec7d[4], vec7d[5], vec7d[6]);
+				            
+				            if (i==0)
+				            {
+				            	mean_translation = mean_translation_current = tf::Vector3(vec7d[0],vec7d[1],vec7d[2]);
+				            	mean_orientation = tf::Quaternion(vec7d[4],vec7d[5],vec7d[6],vec7d[3]);
+				            }
+				            else
+				            {
+			            		ROS_ERROR("mean x = %f",mean_translation_current.getX());
+				            	double tag_x_diff = abs(mean_translation_current.getX() - vec7d[0]);
+				            	double tolerance_x = abs(mean_translation_current.getX() * 0.1);
+				            	if (tag_x_diff > tolerance_x)
+				            	{
+				            		ROS_WARN("This tag will be considered as invalid tag.");
+				            		invalid_tag ++;
+				            		continue;
+				            	}
+				            	else
+				            	{	
+				            		mean_translation_current *= i;
+				            		mean_translation_current += tf::Vector3(vec7d[0],vec7d[1],vec7d[2]);
+				            		mean_translation_current /= (i+1);
+				            	}
+				            	
+				            	mean_translation += tf::Vector3(vec7d[0],vec7d[1],vec7d[2]);
+				            	mean_orientation += tf::Quaternion(vec7d[4],vec7d[5],vec7d[6],vec7d[3]);
+				            }
+				            	
+				        }
+				        int valid_tag = pose_array_size - invalid_tag;
+				        mean_translation /= valid_tag;
+				        mean_orientation /= valid_tag;
+				        mean_orientation.normalize();
+				        fiducial_pose = tf::Transform(mean_orientation, mean_translation);
+				        odo_data = fiducial_pose.inverse();
+			        }
+			        //save odometry data to file
+			        std::vector<double> temp_vec;
+			        temp_vec.push_back(odo_data.getOrigin().getX());
+			        temp_vec.push_back(odo_data.getOrigin().getY());
+			        temp_vec.push_back(odo_data.getOrigin().getZ());
+			        temp_vec.push_back(odo_data.getRotation().w());
+			        temp_vec.push_back(odo_data.getRotation().x());
+			        temp_vec.push_back(odo_data.getRotation().y());
+			        temp_vec.push_back(odo_data.getRotation().z());
+		            ROS_INFO("[fiducials] Odometry data x,y,z,rw,rx,ry,rz: ( %f, %f, %f, %f, %f, %f, %f ) ",
+		            		temp_vec[0],temp_vec[1],temp_vec[2],temp_vec[3],temp_vec[4],temp_vec[5],temp_vec[6]);
+		            odo_vector.push_back(temp_vec);
+			    }
+    		}
+	    	else
+	    		break;
+    	}
+    	//save odometry data to file
+    	std::string odo_path = image_folder + "odo.txt";
+    	ROS_INFO("Creating odometry file under %s", odo_path.c_str());
+    	std::ofstream odo_out;
+    	odo_out.open(odo_path.c_str());
+    	odo_out << odo_vector.size() << std::endl;
+    	for(int oi = 0; oi < odo_vector.size(); oi++)
+    	{
+    		for(int oj = 0; oj < odo_vector[oi].size(); oj++)
+    			odo_out << odo_vector[oi][oj] << " ";
+    		odo_out << std::endl;
+    	}
+    	odo_out.close();
+    	ROS_INFO("Odometry recording finish.");
+    	
+    	//temp: exporting camera information
+    	std::string cam_path = image_folder + "camera_calibration.txt";
+    	ROS_INFO("Creating camera calibration file under %s", cam_path.c_str());
+    	std::ofstream cam_out;
+    	cam_out.open(cam_path.c_str());
+    	cam_out << camera_matrix_.at<double>(0,0) << " " << camera_matrix_.at<double>(0,1) << " " <<  camera_matrix_.at<double>(0,2) << " 0" << std::endl;
+    	cam_out << camera_matrix_.at<double>(1,0) << " " << camera_matrix_.at<double>(1,1) << " " << camera_matrix_.at<double>(1,2) << " 0" << std::endl;
+    	cam_out << camera_matrix_.at<double>(2,0) << " " <<  camera_matrix_.at<double>(2,1)<< " " <<  camera_matrix_.at<double>(2,2) << " 0" << std::endl;
+    	cam_out.close();
+    	ROS_INFO("Camera data recording finish.");
+    	
+    	return true;
+    }
+    
     unsigned long RenderPose(cv::Mat& image, cv::Mat& rot_3x3_CfromO, cv::Mat& trans_3x1_CfromO)
     {
         cv::Mat object_center(3, 1, CV_64FC1);
@@ -971,6 +1266,14 @@ public:
         //	return false;
         //}
         //launch_reconfigure_config_.preFilterCap = StereoPreFilterCap_;
+        
+        //jsf-jy: get directory of color image files to be extracted
+        if (node_handle_.getParam("image_dir", image_dir_) == false)
+        {
+            ROS_ERROR("[fiducials] 'image_dir' not specified in yaml file");
+            return false;
+        }
+        ROS_INFO("[fiducials] image_dir: %s", image_dir_.c_str());
 
         return ipa_Utils::RET_OK;
     }
